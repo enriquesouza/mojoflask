@@ -1,0 +1,14 @@
+[project]
+name = "mojoflask"
+version = "0.1.0"
+description = "Zero-per-request-allocation HTTP server library for Mojo 1.0 (raw POSIX sockets, poll event loop, pre-fork workers)"
+channels = ["https://conda.modular.com/max-nightly", "https://conda.modular.com/max", "https://repo.prefix.dev/modular-community"]
+platforms = ["osx-arm64"]
+
+[dependencies]
+mojo = ">=1.0.0"
+
+[tasks]
+build-example = "mojo build -I src examples/hello.mojo -o hello"
+package = "mojo package src/mojoflask -o mojoflask.mojoc"
+run-example = { cmd = "./hello", env = { ALUGUE_PORT = "18090" } }

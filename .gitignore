@@ -1,0 +1,5 @@
+.pixi/
+*.mojoc
+hello
+__pycache__/
+.DS_Store

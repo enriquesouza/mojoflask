@@ -1,0 +1,115 @@
+# mojoflask
+
+A small HTTP server library for **Mojo 1.0** whose serving hot path performs
+**zero per-request allocation**: every response is a fully serialized byte
+buffer built once at startup, then written by pointer forever after.
+
+Think of it as the fast lane between Fiber/Axum ergonomics and a raw-socket
+benchmark server. On an Apple M3 Max it sustains ~150k RPS on small responses
+and ~43k RPS on 207 KB payloads at concurrency 100, with p50 under 1 ms —
+see the benchmark history in [alugue_mojo_api](https://github.com/enriquesouza/alugue_mojo_api).
+
+## Status
+
+v0.1.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
+the poll(2) core is POSIX so porting is mostly FFI constants.
+
+## Usage (the Fiber comparison)
+
+Go + Fiber:
+
+```go
+app := fiber.New()
+app.Get("/:lang/api/listings/:id", handler)
+app.Listen(":8080")
+```
+
+mojoflask — same shape, one mental-model change: instead of a handler that
+runs per request, you register **prebuilt responses** per route. Routing still
+happens per request; serialization does not.
+
+```mojo
+from mojoflask import (
+    BytePtr, ResponseBuffer, build_response, make_cstr,
+    response_set, route_table, serve, worker_config_from_env,
+)
+
+def static_response(status: String, body: String) -> ResponseBuffer:
+    var ptr: BytePtr = make_cstr(body)
+    return build_response(status, ptr, body.byte_length())
+
+def main():
+    var routes = route_table()
+    _ = routes.add("/{lang}/api/listings/{id:d}")   # :d = digits wildcard
+    _ = routes.add("/health")                        # literal segments
+
+    var responses = response_set()
+    _ = responses.add(static_response("200 OK", "{\"status\":\"ok\"}"))
+    responses.set_fallback(static_response("404 Not Found", "{\"error\":\"not found\"}"))
+
+    serve(worker_config_from_env(8080), routes, responses)
+```
+
+Run it:
+
+```sh
+pixi install                       # or use system mojo >= 1.0.0
+pixi run build-example
+ALUGUE_PORT=8080 ./hello
+curl localhost:8080/health
+```
+
+`ALUGUE_PORT` sets the port, `ALUGUE_WORKERS` the pre-forked worker count
+(default 1; each worker is a full event loop sharing the listener via fd
+passing).
+
+## When to use it
+
+- Responses are cacheable / computable at startup (JSON envelopes, rendered pages, health checks)
+- You need maximum RPS and minimum tail latency on modest hardware
+- You are comfortable owning your payload pipeline (EmberJson serializes once, mojoflask serves forever)
+
+Not yet for: per-request dynamic bodies (handler closures are the roadmap to
+that), TLS, HTTP/2 — put nginx/Caddy in front if you need those today.
+
+## Architecture
+
+| module | role |
+|---|---|
+| `ffi.mojo` | every libc/POSIX touchpoint: sockets, malloc, errno, poll structs, SCM_RIGHTS fd passing. All Darwin quirks documented inline. |
+| `http.mojo` | HTTP/1.1 head parsing (method, path, Content-Length, Connection) and response assembly |
+| `router.mojo` | pattern strings -> segment matchers (`literal`, `{name}` any, `{name:d}` digits); resolution is a linear segment walk, no allocations |
+| `server.mojo` | connection state pool, poll(2) event loop, pre-fork acceptor that round-robins accepted fds to workers over Unix socketpairs, keep-alive state machine |
+
+### Darwin quirks encoded here (read before porting)
+
+- macOS `SO_REUSEPORT` does **not** load-balance listeners (last binder wins),
+  so the parent process accepts and distributes connections via
+  `sendmsg`/`SCM_RIGHTS`; on Linux you could skip that, we don't yet.
+- `fcntl` variadic args mangle through Mojo's C-FFI, so sockets stay blocking
+  and every syscall is gated behind a `poll` readiness event.
+- `SIGPIPE` is ignored at startup; writes to dead peers return errors instead
+  of killing the worker.
+- `EAGAIN=35`, `EINTR=4`, `SO_REUSEPORT=0x200` are hardcoded Darwin values.
+
+## Layout
+
+```
+src/mojoflask/__init__.mojo   public API surface
+src/mojoflask/ffi.mojo        libc layer (the only ugly file, quarantined)
+src/mojoflask/http.mojo       parsing + assembly
+src/mojoflask/router.mojo     RouteTable
+src/mojoflask/server.mojo     event loop + workers + serve()
+examples/hello.mojo           minimal app
+```
+
+## Roadmap
+
+1. Handler closures (`routes.get(pattern, fn)` with a request context struct)
+2. Linux CI + epoll constants audit
+3. Response streaming (chunked) for bodies larger than memory
+4. Optional brotli/gzip of prebuilt buffers at startup
+
+## License
+
+MIT

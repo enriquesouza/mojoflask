@@ -1,0 +1,320 @@
+"""mojoflask.http — HTTP request parsing and response assembly.
+
+Role
+    Everything that reads or writes the wire format: locating the end of the
+    request head, extracting method/path/headers case-insensitively, and
+    stamping out complete response buffers once at startup so the serving hot
+    path never allocates (the prebuilt-static-buffer model).
+
+Darwin quirks encoded here
+    - None of its own; this layer is pure byte crunching. The errno values it
+      relies on indirectly (EAGAIN=35/EINTR=4) are defined in mojoflask.ffi.
+    - Header scanning is deliberately allocation-free: keys are pre-lowered
+      copies built at startup (see standard_header_keys) because per-request
+      malloc would dominate the profile on small responses.
+"""
+
+from mojoflask.ffi import (
+    BytePtr,
+    UntrackedBytePtr,
+    free_bytes,
+    malloc_bytes,
+    null_bytes,
+    untrack,
+)
+
+
+comptime CR = UInt8(13)
+comptime LF = UInt8(10)
+comptime SLASH = UInt8(47)
+comptime SPACE = UInt8(32)
+comptime TAB = UInt8(9)
+comptime QMARK = UInt8(63)
+
+
+comptime HEADER_TAIL = "\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'\r\nReferrer-Policy: strict-origin-when-cross-origin\r\nPermissions-Policy: geolocation=(), microphone=(), camera=()\r\nVary: origin\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Expose-Headers: retry-after\r\nConnection: keep-alive\r\n\r\n"
+comptime HEADER_CONTENT_LENGTH_KEY = "content-length:"
+comptime HEADER_CONNECTION_KEY = "connection:"
+comptime TOKEN_CLOSE = "close"
+
+
+comptime MAX_ROUTES = 64
+comptime UntrackedResponseBufferPtr = Pointer[
+    T=ResponseBuffer, mut=True, origin=UntrackedOrigin[mut=True]
+]
+
+
+@fieldwise_init
+struct ResponseBuffer(RegisterPassable, ImplicitlyCopyable):
+    """One fully serialized HTTP response (status line through last body byte),
+    built once at startup and served by pointer forever after."""
+
+    var data: UntrackedBytePtr
+    var length: Int
+
+
+@fieldwise_init
+struct ResponseSet(RegisterPassable, ImplicitlyCopyable):
+    """Route-indexed table of prebuilt responses plus a fallback for misses."""
+
+    var count: Int
+    var buffers: UntrackedResponseBufferPtr
+    var fallback: ResponseBuffer
+
+    def add(mut self, response: ResponseBuffer) -> Int:
+        """Register a response; returns its route index."""
+        self.buffers[self.count] = response
+        self.count += 1
+        return self.count - 1
+
+    def set_fallback(mut self, response: ResponseBuffer):
+        """Install the response served when no route matches."""
+        self.fallback = response
+
+    def at(self, route_index: Int) -> ResponseBuffer:
+        """Response for a route index; anything unresolved gets the fallback."""
+        if route_index < 0 or route_index >= self.count:
+            return self.fallback
+        return self.buffers[route_index]
+
+
+def response_set() -> ResponseSet:
+    """Create an empty response table (startup-only, heap-backed)."""
+    return ResponseSet(
+        count=0,
+        buffers=UntrackedResponseBufferPtr(unsafe_from_address=Int(malloc_bytes(8 * MAX_ROUTES))),
+        fallback=ResponseBuffer(data=null_bytes(), length=0),
+    )
+
+
+@fieldwise_init
+struct RequestHeaderKeys(RegisterPassable, ImplicitlyCopyable):
+    """Pre-lowered header lookup needles shared by every connection scan."""
+
+    var content_length_key: UntrackedBytePtr
+    var content_length_len: Int
+    var connection_key: UntrackedBytePtr
+    var connection_len: Int
+    var close_token: UntrackedBytePtr
+    var close_token_len: Int
+
+
+def standard_header_keys() -> RequestHeaderKeys:
+    """Build lowered copies of the three needles used while parsing heads."""
+    var cl = lower_bytes_copy(HEADER_CONTENT_LENGTH_KEY)
+    var co = lower_bytes_copy(HEADER_CONNECTION_KEY)
+    var tk = lower_bytes_copy(TOKEN_CLOSE)
+    return RequestHeaderKeys(
+        content_length_key=untrack(cl),
+        content_length_len=HEADER_CONTENT_LENGTH_KEY.byte_length(),
+        connection_key=untrack(co),
+        connection_len=HEADER_CONNECTION_KEY.byte_length(),
+        close_token=untrack(tk),
+        close_token_len=TOKEN_CLOSE.byte_length(),
+    )
+
+
+def ascii_lower_byte(b: UInt8) -> UInt8:
+    """Lowercase a single ASCII letter; other bytes pass through."""
+    if b >= UInt8(65) and b <= UInt8(90):
+        return b + UInt8(32)
+    return b
+
+
+def lower_bytes_copy(s: String) -> BytePtr:
+    """Heap-copy a String with ASCII letters lowercased (header needles)."""
+    var n = s.byte_length()
+    var p = malloc_bytes(n)
+    var i = 0
+    for b in s.bytes():
+        p[i] = ascii_lower_byte(b)
+        i += 1
+    return p
+
+
+def decimal_digit_count(v_in: Int) -> Int:
+    """How many decimal digits v needs when printed."""
+    var n = 1
+    var x = v_in // 10
+    while x > 0:
+        n += 1
+        x //= 10
+    return n
+
+
+def append_string(dst: BytePtr, at: Int, s: String) -> Int:
+    """Copy s into dst at offset at; returns the next free offset."""
+    var i = at
+    for b in s.bytes():
+        dst[i] = b
+        i += 1
+    return i
+
+
+def write_decimal(dst: BytePtr, at: Int, v_in: Int) -> Int:
+    """Write v as decimal digits at offset at; returns the next free offset."""
+    var tmp = malloc_bytes(24)
+    var n = 0
+    var v = v_in
+    if v == 0:
+        tmp[0] = UInt8(48)
+        n = 1
+    else:
+        while v > 0:
+            tmp[n] = UInt8(48 + (v % 10))
+            n += 1
+            v //= 10
+    var i = at
+    var k = n
+    while k > 0:
+        k -= 1
+        dst[i] = tmp[k]
+        i += 1
+    free_bytes(tmp)
+    return i
+
+
+def build_response(status_line: String, body: BytePtr, body_len: Int) -> ResponseBuffer:
+    """Serialize one full HTTP response around a preloaded body.
+
+    Layout: status line, Content-Length, fixed security-header tail, body.
+    Called only during startup; the returned buffer is immutable in practice.
+    """
+    var head_pre = "HTTP/1.1 " + status_line + "\r\nServer: alugue-hybrid\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: "
+    var total = head_pre.byte_length() + decimal_digit_count(body_len) + HEADER_TAIL.byte_length() + body_len
+    var p = malloc_bytes(total)
+    var at = append_string(p, 0, head_pre)
+    at = write_decimal(p, at, body_len)
+    at = append_string(p, at, HEADER_TAIL)
+    var i = 0
+    while i < body_len:
+        p[at + i] = body[i]
+        i += 1
+    return ResponseBuffer(data=untrack(p), length=total)
+
+
+def find_header_end(p: BytePtr, start: Int, end: Int) -> Int:
+    """Offset of the CRLFCRLF that terminates the request head, else -1.
+
+    Scans for the 4-byte sequence \\r\\n\\r\\n between start and end.
+    """
+    var j = start
+    while j + 3 < end:
+        if p[j] == CR and p[j + 1] == LF and p[j + 2] == CR and p[j + 3] == LF:
+            return j
+        j += 1
+    return -1
+
+
+def ci_find(p: BytePtr, s: Int, e: Int, key: UntrackedBytePtr, kn: Int) -> Int:
+    """Case-insensitive substring search of key within p[s:e]; -1 when absent.
+
+    The needle must already be lowercase; the haystack is lowered on the fly.
+    """
+    if e - s < kn:
+        return -1
+    var i = s
+    var lim = e - kn
+    while i <= lim:
+        var k = 0
+        var ok = True
+        while k < kn:
+            if ascii_lower_byte(p[i + k]) != key[k]:
+                ok = False
+                break
+            k += 1
+        if ok:
+            return i
+        i += 1
+    return -1
+
+
+def parse_content_length(p: BytePtr, hs: Int, he: Int, keys: RequestHeaderKeys) -> Int:
+    """Numeric Content-Length from the head [hs,he); 0 when absent/garbled."""
+    var k = ci_find(p, hs, he, keys.content_length_key, keys.content_length_len)
+    if k < 0:
+        return 0
+    var i = k + keys.content_length_len
+    while i < he and (p[i] == SPACE or p[i] == TAB):
+        i += 1
+    var v = 0
+    while i < he:
+        var b = p[i]
+        if b < UInt8(48) or b > UInt8(57):
+            break
+        v = v * 10 + (Int(b) - 48)
+        i += 1
+    return v
+
+
+def wants_close(p: BytePtr, hs: Int, he: Int, keys: RequestHeaderKeys) -> Bool:
+    """True when Connection: close appears anywhere in the head."""
+    var k = ci_find(p, hs, he, keys.connection_key, keys.connection_len)
+    if k < 0:
+        return False
+    var vs = k + keys.connection_len
+    var ve = vs
+    while ve < he and p[ve] != CR and p[ve] != LF:
+        ve += 1
+    return ci_find(p, vs, ve, keys.close_token, keys.close_token_len) >= 0
+
+
+@fieldwise_init
+struct ParsedHead(RegisterPassable):
+    """Result of splitting one request head into its routing-relevant parts.
+
+    method_start/method_end bracket the verb (kept for future use — routing
+    currently ignores the method). path_start/path_end bracket the path with
+    any ?query stripped. content_length drives body draining and
+    connection_close records an explicit Connection: close.
+    """
+
+    var method_start: Int
+    var method_end: Int
+    var path_start: Int
+    var path_end: Int
+    var content_length: Int
+    var connection_close: Bool
+
+
+def parse_request_head(p: BytePtr, start: Int, head_end: Int, keys: RequestHeaderKeys) -> ParsedHead:
+    """Split the first request line of the head [start, head_end).
+
+    Line ends at the first CR or LF; method is text before the first space;
+    path runs to the next space, truncated at '?'. Malformed lines yield an
+    empty path so routing falls through to 404 rather than crashing. Header
+    scans reuse the caller's pre-lowered `keys` needles.
+    """
+    var line_end = start
+    while line_end < head_end and p[line_end] != CR and p[line_end] != LF:
+        line_end += 1
+    var m1 = start
+    while m1 < line_end and p[m1] != SPACE:
+        m1 += 1
+    if m1 >= line_end:
+        return ParsedHead(
+            method_start=start,
+            method_end=start,
+            path_start=start,
+            path_end=start,
+            content_length=0,
+            connection_close=False,
+        )
+    var ps = m1 + 1
+    var pe = ps
+    while pe < line_end and p[pe] != SPACE:
+        pe += 1
+    var q = ps
+    while q < pe:
+        if p[q] == QMARK:
+            pe = q
+            break
+        q += 1
+    return ParsedHead(
+        method_start=start,
+        method_end=m1,
+        path_start=ps,
+        path_end=pe,
+        content_length=parse_content_length(p, start, head_end, keys),
+        connection_close=wants_close(p, start, head_end, keys),
+    )
