@@ -174,13 +174,16 @@ def write_decimal(dst: BytePtr, at: Int, v_in: Int) -> Int:
     return i
 
 
-def build_response(status_line: String, body: BytePtr, body_len: Int) -> ResponseBuffer:
+def build_response(
+    status_line: String, body: BytePtr, body_len: Int, server_name: String = "mojoflask"
+) -> ResponseBuffer:
     """Serialize one full HTTP response around a preloaded body.
 
-    Layout: status line, Content-Length, fixed security-header tail, body.
-    Called only during startup; the returned buffer is immutable in practice.
+    Layout: status line, Server, Content-Type, Content-Length, fixed
+    security-header tail, body. Called only during startup; the returned
+    buffer is immutable in practice. `server_name` fills the Server header.
     """
-    var head_pre = "HTTP/1.1 " + status_line + "\r\nServer: alugue-hybrid\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: "
+    var head_pre = "HTTP/1.1 " + status_line + "\r\nServer: " + server_name + "\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: "
     var total = head_pre.byte_length() + decimal_digit_count(body_len) + HEADER_TAIL.byte_length() + body_len
     var p = malloc_bytes(total)
     var at = append_string(p, 0, head_pre)

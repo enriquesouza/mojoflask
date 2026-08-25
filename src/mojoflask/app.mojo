@@ -37,6 +37,7 @@ struct App(Movable):
     var routes: RouteTable
     var responses: ResponseSet
     var config: WorkerConfig
+    var server_name: String
     var arena: UntrackedBytePtr
     var arena_cap: Int
     var arena_used: Int
@@ -47,7 +48,9 @@ struct App(Movable):
         workers: Int = 1,
         arena_mb: Int = 4,
         read_env: Bool = False,
+        server_name: String = "mojoflask",
     ):
+        self.server_name = server_name
         self.routes = route_table()
         self.responses = response_set()
         if read_env:
@@ -66,7 +69,9 @@ struct App(Movable):
         """Serve `body` verbatim with a custom status line on GET `path`."""
         var route = self.routes.add(path)
         var ptr: BytePtr = make_cstr(body)
-        _ = self.responses.add(build_response(status, ptr, body.byte_length()))
+        _ = self.responses.add(
+            build_response(status, ptr, body.byte_length(), self.server_name)
+        )
         return route
 
     def get_file(mut self, path: String, file_path: String) -> Int:
@@ -80,25 +85,27 @@ struct App(Movable):
             fatal("App arena exhausted; construct with a larger arena_mb")
         var dst: BytePtr = retracked(self.arena) + self.arena_used
         var n = read_file_into(file_path, dst, self.arena_cap - self.arena_used)
-        _ = self.responses.add(build_response("200 OK", dst, n))
+        _ = self.responses.add(build_response("200 OK", dst, n, self.server_name))
         self.arena_used += n
         return route
 
     def fallback(mut self, body: String):
         """Serve `body` with status 404 when no route matches."""
         var ptr: BytePtr = make_cstr(body)
-        self.responses.set_fallback(build_response("404 Not Found", ptr, body.byte_length()))
+        self.responses.set_fallback(
+            build_response("404 Not Found", ptr, body.byte_length(), self.server_name)
+        )
 
     def run(self):
         """Bind, fork workers and enter the event loop. Never returns."""
         serve(self.config, self.routes, self.responses)
 
 
-def app_from_env(default_port: Int, arena_mb: Int = 4) -> App:
-    """Build an App whose port/workers come from ALUGUE_PORT/ALUGUE_WORKERS.
+def app_from_env(default_port: Int, arena_mb: Int = 4, server_name: String = "mojoflask") -> App:
+    """Build an App whose port/workers come from MOJOFLASK_PORT/MOJOFLASK_WORKERS.
 
     Mirrors worker_config_from_env(); falls back to `default_port` and one
     worker when the environment variables are unset.
     """
-    var app = App(port=default_port, arena_mb=arena_mb, read_env=True)
+    var app = App(port=default_port, arena_mb=arena_mb, read_env=True, server_name=server_name)
     return app^

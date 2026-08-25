@@ -11,4 +11,4 @@ mojo = ">=1.0.0"
 [tasks]
 build-example = "mojo build -I src examples/hello.mojo -o hello"
 package = "mojo package src/mojoflask -o mojoflask.mojoc"
-run-example = { cmd = "./hello", env = { ALUGUE_PORT = "18090" } }
+run-example = { cmd = "./hello", env = { MOJOFLASK_PORT = "18090" } }

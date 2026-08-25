@@ -334,8 +334,8 @@ def env_int(name: String, default_value: Int) -> Int:
 
 
 def worker_config_from_env(default_port: Int) -> WorkerConfig:
-    """ALUGUE_PORT / ALUGUE_WORKERS driven config for drop-in deployments."""
-    return worker_config(env_int("ALUGUE_PORT", default_port), env_int("ALUGUE_WORKERS", 1))
+    """MOJOFLASK_PORT / MOJOFLASK_WORKERS driven config for drop-in deployments."""
+    return worker_config(env_int("MOJOFLASK_PORT", default_port), env_int("MOJOFLASK_WORKERS", 1))
 
 
 def conn_table(config: WorkerConfig) -> ConnTable:
@@ -466,7 +466,7 @@ def worker_loop(
     var source_fd = listener
     if Int(pair_fd) >= 0:
         source_fd = pair_fd
-    print("alugue-mojo worker pid=", current_pid(), " port=", config.port)
+    print("mojoflask worker pid=", current_pid(), " port=", config.port)
     while True:
         var count = 1
         conns.poll_fds[0] = PollFd(fd=source_fd, events=POLLIN, revents=UInt16(0))

@@ -5,9 +5,7 @@ A small HTTP server library for **Mojo 1.0** whose serving hot path performs
 buffer built once at startup, then written by pointer forever after.
 
 Think of it as the fast lane between Fiber/Axum ergonomics and a raw-socket
-benchmark server. On an Apple M3 Max it sustains ~150k RPS on small responses
-and ~43k RPS on 207 KB payloads at concurrency 100, with p50 under 1 ms —
-see the benchmark history in [alugue_mojo_api](https://github.com/enriquesouza/alugue_mojo_api).
+benchmark server. 
 
 ## Status
 
@@ -55,11 +53,11 @@ Run it:
 ```sh
 pixi install                       # or use system mojo >= 1.0.0
 pixi run build-example
-ALUGUE_PORT=8080 ./hello
+MOJOFLASK_PORT=8080 ./hello
 curl localhost:8080/health
 ```
 
-`ALUGUE_PORT` sets the port, `ALUGUE_WORKERS` the pre-forked worker count
+`MOJOFLASK_PORT` sets the port, `MOJOFLASK_WORKERS` the pre-forked worker count
 (default 1; each worker is a full event loop sharing the listener via fd
 passing).
 
