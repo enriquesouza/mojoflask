@@ -1,14 +1,37 @@
-[project]
+[workspace]
+authors = ["Enrique Souza"]
+channels = ["conda-forge", "https://conda.modular.com/max-nightly", "https://conda.modular.com/max", "https://repo.prefix.dev/modular-community"]
+preview = ["pixi-build"]
+description = "Zero-per-request-allocation HTTP server library for Mojo 1.0"
 name = "mojoflask"
-version = "0.1.0"
-description = "Zero-per-request-allocation HTTP server library for Mojo 1.0 (raw POSIX sockets, poll event loop, pre-fork workers)"
-channels = ["https://conda.modular.com/max-nightly", "https://conda.modular.com/max", "https://repo.prefix.dev/modular-community"]
 platforms = ["osx-arm64"]
+version = "0.1.0"
+license = "MIT"
+license-file = "LICENSE"
+readme = "README.md"
+homepage = "https://github.com/enriquesouza/mojoflask"
+repository = "https://github.com/enriquesouza/mojoflask"
+
+[tasks]
+build-example = { cmd = "mojo build -I . examples/hello.mojo -o hello", env = { MOJOFLASK_PORT = "18090" } }
+run-example = "./hello"
+precompile = "mojo precompile mojoflask -o mojoflask.mojoc"
 
 [dependencies]
 mojo = ">=1.0.0"
 
-[tasks]
-build-example = "mojo build -I src examples/hello.mojo -o hello"
-package = "mojo package src/mojoflask -o mojoflask.mojoc"
-run-example = { cmd = "./hello", env = { MOJOFLASK_PORT = "18090" } }
+[package]
+name = "mojoflask"
+version = "0.1.0"
+
+[package.build]
+backend = { name = "pixi-build-mojo", version = "0.*" }
+
+[package.host-dependencies]
+mojo-compiler = ">=1.0.0"
+
+[package.build-dependencies]
+mojo-compiler = ">=1.0.0"
+
+[package.run-dependencies]
+mojo-compiler = ">=1.0.0"

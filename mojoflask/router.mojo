@@ -40,6 +40,7 @@ from mojoflask.ffi import (
     fatal,
     free_bytes,
     make_cstr,
+    malloc_bytes,
     null_bytes,
     untrack,
 )

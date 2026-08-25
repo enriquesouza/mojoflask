@@ -93,11 +93,11 @@ that), TLS, HTTP/2 — put nginx/Caddy in front if you need those today.
 ## Layout
 
 ```
-src/mojoflask/__init__.mojo   public API surface
-src/mojoflask/ffi.mojo        libc layer (the only ugly file, quarantined)
-src/mojoflask/http.mojo       parsing + assembly
-src/mojoflask/router.mojo     RouteTable
-src/mojoflask/server.mojo     event loop + workers + serve()
+mojoflask/__init__.mojo   public API surface
+mojoflask/ffi.mojo        libc layer (the only ugly file, quarantined)
+mojoflask/http.mojo       parsing + assembly
+mojoflask/router.mojo     RouteTable
+mojoflask/server.mojo     event loop + workers + serve()
 examples/hello.mojo           minimal app
 ```
 
