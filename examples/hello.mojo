@@ -6,7 +6,7 @@ Serves two routes with responses serialized once at startup:
     GET /health   -> {"status":"ok"}
 
 Run:
-    pixi run build-example && ALUGUE_PORT=8080 ./hello
+    pixi run build-example && MOJOFLASK_PORT=8080 ./hello
 """
 
 from mojoflask import App
