@@ -41,10 +41,19 @@ struct App(Movable):
     var arena_cap: Int
     var arena_used: Int
 
-    def __init__(out self, port: Int = 18090, workers: Int = 1, arena_mb: Int = 4):
+    def __init__(
+        out self,
+        port: Int = 18090,
+        workers: Int = 1,
+        arena_mb: Int = 4,
+        read_env: Bool = False,
+    ):
         self.routes = route_table()
         self.responses = response_set()
-        self.config = worker_config(port, workers)
+        if read_env:
+            self.config = worker_config_from_env(port)
+        else:
+            self.config = worker_config(port, workers)
         self.arena_cap = arena_mb * 1024 * 1024
         self.arena_used = 0
         self.arena = untrack(malloc_bytes(self.arena_cap))
@@ -84,10 +93,6 @@ struct App(Movable):
         """Bind, fork workers and enter the event loop. Never returns."""
         serve(self.config, self.routes, self.responses)
 
-    def adopt_config(mut self, owned config: WorkerConfig):
-        """Replace the worker config (used by app_from_env)."""
-        self.config = config^
-
 
 def app_from_env(default_port: Int, arena_mb: Int = 4) -> App:
     """Build an App whose port/workers come from ALUGUE_PORT/ALUGUE_WORKERS.
@@ -95,6 +100,5 @@ def app_from_env(default_port: Int, arena_mb: Int = 4) -> App:
     Mirrors worker_config_from_env(); falls back to `default_port` and one
     worker when the environment variables are unset.
     """
-    var app = App(port=0, workers=1, arena_mb=arena_mb)
-    app.adopt_config(worker_config_from_env(default_port))
+    var app = App(port=default_port, arena_mb=arena_mb, read_env=True)
     return app^
