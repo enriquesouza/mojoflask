@@ -84,7 +84,7 @@ struct App(Movable):
         """Bind, fork workers and enter the event loop. Never returns."""
         serve(self.config, self.routes, self.responses)
 
-    def adopt_config(mut self, config: WorkerConfig):
+    def adopt_config(mut self, owned config: WorkerConfig):
         """Replace the worker config (used by app_from_env)."""
         self.config = config^
 
