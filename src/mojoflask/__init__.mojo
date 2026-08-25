@@ -1,6 +1,7 @@
 """mojoflask — a readable, zero-per-request-allocation HTTP server library.
 
 Public API
+    App / app_from_env()          the high-level builder: app.get(...), app.run()
     RouteTable / route_table()   declare routes as pattern strings at startup
     ResponseBuffer / build_response()
                                  prebuild whole responses once, serve by pointer
@@ -12,6 +13,8 @@ Public API
 Design notes and the Darwin quirks this encodes are documented per module;
 start with mojoflask.server for the SO_REUSEPORT/SCM_RIGHTS story.
 """
+
+from .app import App, app_from_env
 
 from .ffi import (
     BytePtr,
