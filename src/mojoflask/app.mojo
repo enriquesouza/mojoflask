@@ -23,6 +23,7 @@ from .ffi import (
     make_cstr,
     malloc_bytes,
     read_file_into,
+    retracked,
     untrack,
 )
 from .http import ResponseSet, build_response, response_set
@@ -30,7 +31,7 @@ from .router import RouteTable, route_table
 from .server import WorkerConfig, serve, worker_config, worker_config_from_env
 
 
-struct App:
+struct App(Movable):
     """A mojoflask application: routes + prebuilt responses + worker config."""
 
     var routes: RouteTable
@@ -83,6 +84,10 @@ struct App:
         """Bind, fork workers and enter the event loop. Never returns."""
         serve(self.config, self.routes, self.responses)
 
+    def adopt_config(mut self, config: WorkerConfig):
+        """Replace the worker config (used by app_from_env)."""
+        self.config = config^
+
 
 def app_from_env(default_port: Int, arena_mb: Int = 4) -> App:
     """Build an App whose port/workers come from ALUGUE_PORT/ALUGUE_WORKERS.
@@ -90,7 +95,6 @@ def app_from_env(default_port: Int, arena_mb: Int = 4) -> App:
     Mirrors worker_config_from_env(); falls back to `default_port` and one
     worker when the environment variables are unset.
     """
-    var config = worker_config_from_env(default_port)
     var app = App(port=0, workers=1, arena_mb=arena_mb)
-    app.config = config
-    return app
+    app.adopt_config(worker_config_from_env(default_port))
+    return app^
