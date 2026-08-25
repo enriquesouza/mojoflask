@@ -34,7 +34,11 @@ def main():
 Each verb binds its route to that HTTP method's mask; a request with a
 different verb on the same path falls through to the fallback response.
 `app.get_file(path, file)` and `app.get_status(path, status, body)` stay
-GET-bound. Under the hood routes carry method bitmasks (`METHOD_GET`,
+string/file-flavored; `app.route(mask, path, status, body)` and
+`app.route_file(mask, path, status, file)` take an explicit METHOD_* mask
+(e.g. `METHOD_GET | METHOD_QUERY`) for combined-verb handlers and non-200
+write statuses. `get_file` is GET-bound. Under the hood routes carry method
+bitmasks (`METHOD_GET`,
 `METHOD_POST`, `METHOD_PUT`, `METHOD_PATCH`, `METHOD_DELETE`, `METHOD_QUERY`,
 or `METHOD_ANY`), and `RouteTable.add_method(mask, pattern)` exposes them to
 raw-table users while `routes.add(pattern)` keeps accepting any method.

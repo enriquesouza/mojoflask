@@ -13,10 +13,11 @@ Every verb helper (`get`, `post`, `put`, `patch`, `delete_route`) registers
 the route AND its prebuilt response together, which keeps their indexes in
 lockstep (the server looks responses up by route index). Routes are bound to
 their verb's method mask; requests using a different verb on the same path
-fall through to the fallback response. Bodies passed as strings are
-serialized once here at startup; bodies loaded from files stream through a
-private arena that is reused for each subsequent file. After run() the hot
-path performs zero allocations.
+fall through to the fallback response. `route`/`route_file` take an explicit
+METHOD_* mask for combined-verb handlers and non-200 write statuses. Bodies
+passed as strings are serialized once here at startup; bodies loaded from
+files stream through a private arena that is reused for each subsequent file.
+After run() the hot path performs zero allocations.
 """
 
 from .ffi import (
@@ -124,12 +125,43 @@ struct App(Movable):
         The file is read once into the App's startup arena and never touched
         again — requests are answered from the prebuilt response buffer.
         """
-        var route = self.routes.add_method(METHOD_GET, path)
+        return self._register_file(METHOD_GET, path, "200 OK", file_path)
+
+    def get_file_status(
+        mut self, path: String, status: String, file_path: String
+    ) -> Int:
+        """Serve the bytes of `file_path` with a custom status on GET `path`."""
+        return self._register_file(METHOD_GET, path, status, file_path)
+
+    def route(mut self, mask: UInt8, path: String, status: String, body: String) -> Int:
+        """Bind an explicit METHOD_* mask to a pattern and a string body.
+
+        Escape hatch for combinations the verb helpers don't name: combined
+        masks (METHOD_GET | METHOD_QUERY) and non-200 statuses on writes.
+        """
+        return self._register(mask, path, status, body)
+
+    def route_file(
+        mut self, mask: UInt8, path: String, status: String, file_path: String
+    ) -> Int:
+        """Bind an explicit METHOD_* mask to a pattern and a file-backed body."""
+        return self._register_file(mask, path, status, file_path)
+
+    def _register_file(
+        mut self, mask: UInt8, path: String, status: String, file_path: String
+    ) -> Int:
+        """File-backed twin of _register: read once, prebuild, keep indexes in
+        lockstep.
+
+        The body streams straight from disk into the startup arena, so large
+        payloads are never copied through a second buffer.
+        """
+        var route = self.routes.add_method(mask, path)
         if self.arena_used >= self.arena_cap:
             fatal("App arena exhausted; construct with a larger arena_mb")
         var dst: BytePtr = retracked(self.arena) + self.arena_used
         var n = read_file_into(file_path, dst, self.arena_cap - self.arena_used)
-        _ = self.responses.add(build_response("200 OK", dst, n, self.server_name))
+        _ = self.responses.add(build_response(status, dst, n, self.server_name))
         self.arena_used += n
         return route
 
