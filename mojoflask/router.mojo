@@ -63,6 +63,15 @@ comptime COLON = UInt8(58)
 comptime LETTER_D = UInt8(100)
 
 
+comptime METHOD_GET = UInt8(1)
+comptime METHOD_POST = UInt8(2)
+comptime METHOD_PUT = UInt8(4)
+comptime METHOD_PATCH = UInt8(8)
+comptime METHOD_DELETE = UInt8(16)
+comptime METHOD_QUERY = UInt8(32)
+comptime METHOD_ANY = UInt8(63)
+
+
 @fieldwise_init
 struct RouteMatcher(RegisterPassable, ImplicitlyCopyable):
     """One path-segment test: a kind plus optional literal bytes."""
@@ -74,20 +83,37 @@ struct RouteMatcher(RegisterPassable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct RouteTable(RegisterPassable, ImplicitlyCopyable):
-    """Ordered list of compiled routes; earlier registrations win on overlap."""
+    """Ordered list of compiled routes; earlier registrations win on overlap.
+
+    Each route carries a method bitmask (METHOD_GET, METHOD_POST, ... or the
+    all-bits METHOD_ANY); resolution only accepts routes whose mask admits the
+    request's method code. Routes registered through `add` keep mask ANY, so
+    method-less tables behave exactly as before masks existed.
+    """
 
     var count: Int
     var seg_counts: Pointer[T=Int32, mut=True, origin=UntrackedOrigin[mut=True]]
     var matchers: Pointer[
         T=RouteMatcher, mut=True, origin=UntrackedOrigin[mut=True]
     ]
+    var method_masks: Pointer[T=UInt8, mut=True, origin=UntrackedOrigin[mut=True]]
 
     def add(mut self, pattern: String) -> Int:
         """Compile one pattern into matchers; returns its registration index.
 
         Startup-only. Segments between slashes are classified by
         compile_matcher; literals keep their exact bytes because matching is
-        case-sensitive by design.
+        case-sensitive by design. The route accepts every HTTP method (mask
+        ANY); use add_method to restrict it.
+        """
+        return self.add_method(METHOD_ANY, pattern)
+
+    def add_method(mut self, method_mask: UInt8, pattern: String) -> Int:
+        """Compile one pattern bound to `method_mask`; returns its index.
+
+        The mask is one or more METHOD_* bits OR-ed together; matching later
+        requires the request's method code to share at least one bit. A mask
+        of METHOD_ANY restores unconditional acceptance.
         """
         var route = self.count
         if route >= MAX_ROUTES:
@@ -112,17 +138,34 @@ struct RouteTable(RegisterPassable, ImplicitlyCopyable):
         if seg == 0 and total != 1:
             fatal("empty route pattern")
         self.seg_counts[route] = Int32(seg)
+        self.method_masks[route] = method_mask
         self.count += 1
         return route
 
     def resolve(self, p: BytePtr, ps: Int, pe: Int) -> Int:
-        """Index of the first route matching path p[ps:pe), else -1."""
+        """Index of the first route matching path p[ps:pe), else -1.
+
+        Method-agnostic form kept for existing callers; equivalent to
+        resolve_method with METHOD_ANY.
+        """
+        return self.resolve_method(p, ps, pe, METHOD_ANY)
+
+    def resolve_method(self, p: BytePtr, ps: Int, pe: Int, method_code: UInt8) -> Int:
+        """Index of the first route matching path AND method, else -1.
+
+        A route matches when its segment pattern accepts the path and its
+        mask admits the method code — ANY-masked routes always do; masked
+        routes need at least one shared bit. Unmatched methods fall through
+        to -1 so the caller serves its fallback response.
+        """
         if ps >= pe or p[ps] != SLASH:
             return -1
         var r = 0
         while r < self.count:
             if self.route_matches(r, p, ps, pe):
-                return r
+                var m = self.method_masks[r]
+                if m == METHOD_ANY or (m & method_code) != UInt8(0):
+                    return r
             r += 1
         return -1
 
@@ -162,6 +205,9 @@ def route_table() -> RouteTable:
         ),
         matchers=Pointer[T=RouteMatcher, mut=True, origin=UntrackedOrigin[mut=True]](
             unsafe_from_address=Int(malloc_bytes(24 * MAX_ROUTES * MAX_ROUTE_SEGS))
+        ),
+        method_masks=Pointer[T=UInt8, mut=True, origin=UntrackedOrigin[mut=True]](
+            unsafe_from_address=Int(malloc_bytes(MAX_ROUTES))
         ),
     )
 

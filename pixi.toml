@@ -5,7 +5,7 @@ preview = ["pixi-build"]
 description = "Zero-per-request-allocation HTTP server library for Mojo 1.0"
 name = "mojoflask"
 platforms = ["osx-arm64"]
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 license-file = "LICENSE"
 readme = "README.md"
@@ -22,7 +22,7 @@ mojo = ">=1.0.0"
 
 [package]
 name = "mojoflask"
-version = "0.1.0"
+version = "0.2.0"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }

@@ -230,7 +230,9 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                         return
                     break
                 var head = parse_request_head(buf, off, hend, keys)
-                var route_idx = routes.resolve(buf, head.path_start, head.path_end)
+                var route_idx = routes.resolve_method(
+                    buf, head.path_start, head.path_end, head.method_code
+                )
                 var chosen = responses.at(route_idx)
                 self.slots[i].resp_data = chosen.data
                 self.slots[i].resp_len = Int32(chosen.length)

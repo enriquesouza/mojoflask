@@ -1,9 +1,10 @@
 """hello — minimal mojoflask app.
 
-Serves two routes with responses serialized once at startup:
+Serves three routes with responses serialized once at startup:
 
-    GET /         -> {"message":"hello from mojoflask"}
-    GET /health   -> {"status":"ok"}
+    GET  /            -> {"message":"hello from mojoflask"}
+    GET  /health      -> {"status":"ok"}
+    POST /echo-note   -> {"note":"received"}   (GET on it falls to the 404)
 
 Run:
     pixi run build-example && MOJOFLASK_PORT=8080 ./hello
@@ -17,6 +18,7 @@ def main():
 
     app.get("/", "{\"message\":\"hello from mojoflask\"}")
     app.get("/health", "{\"status\":\"ok\"}")
+    app.post("/echo-note", "{\"note\":\"received\"}")
     app.fallback("{\"error\":\"not found\"}")
 
     app.run()

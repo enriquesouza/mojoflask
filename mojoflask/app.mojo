@@ -9,11 +9,14 @@ application code never sees a pointer:
     app.fallback("{\\"error\\":\\"not found\\"}")
     app.run()
 
-Every `get*` call registers the route AND its prebuilt response together,
-which keeps their indexes in lockstep (the server looks responses up by
-route index). Bodies passed as strings are serialized once here at startup;
-bodies loaded from files stream through a private arena that is reused for
-each subsequent file. After run() the hot path performs zero allocations.
+Every verb helper (`get`, `post`, `put`, `patch`, `delete_route`) registers
+the route AND its prebuilt response together, which keeps their indexes in
+lockstep (the server looks responses up by route index). Routes are bound to
+their verb's method mask; requests using a different verb on the same path
+fall through to the fallback response. Bodies passed as strings are
+serialized once here at startup; bodies loaded from files stream through a
+private arena that is reused for each subsequent file. After run() the hot
+path performs zero allocations.
 """
 
 from .ffi import (
@@ -27,7 +30,15 @@ from .ffi import (
     untrack,
 )
 from .http import ResponseSet, build_response, response_set
-from .router import RouteTable, route_table
+from .router import (
+    METHOD_GET,
+    METHOD_POST,
+    METHOD_PUT,
+    METHOD_PATCH,
+    METHOD_DELETE,
+    RouteTable,
+    route_table,
+)
 from .server import WorkerConfig, serve, worker_config, worker_config_from_env
 
 
@@ -67,7 +78,40 @@ struct App(Movable):
 
     def get_status(mut self, path: String, status: String, body: String) -> Int:
         """Serve `body` verbatim with a custom status line on GET `path`."""
-        var route = self.routes.add(path)
+        return self._register(METHOD_GET, path, status, body)
+
+    def post(mut self, path: String, body: String) -> Int:
+        """Serve `body` verbatim with status 200 on POST `path`.
+
+        Same lockstep registration as get(): the route index and its prebuilt
+        response share one slot. Other verbs on this path fall through to the
+        fallback response.
+        """
+        return self._register(METHOD_POST, path, "200 OK", body)
+
+    def put(mut self, path: String, body: String) -> Int:
+        """Serve `body` verbatim with status 200 on PUT `path`."""
+        return self._register(METHOD_PUT, path, "200 OK", body)
+
+    def patch(mut self, path: String, body: String) -> Int:
+        """Serve `body` verbatim with status 200 on PATCH `path`."""
+        return self._register(METHOD_PATCH, path, "200 OK", body)
+
+    def delete_route(mut self, path: String, body: String) -> Int:
+        """Serve `body` verbatim with status 200 on DELETE `path`.
+
+        Named delete_route instead of delete to stay clear of reserved-word
+        territory across Mojo tooling.
+        """
+        return self._register(METHOD_DELETE, path, "200 OK", body)
+
+    def _register(mut self, mask: UInt8, path: String, status: String, body: String) -> Int:
+        """Bind one method mask to a pattern and prebuild its response.
+
+        Single funnel for every verb helper; keeps route and response indexes
+        in lockstep because each call appends to both tables.
+        """
+        var route = self.routes.add_method(mask, path)
         var ptr: BytePtr = make_cstr(body)
         _ = self.responses.add(
             build_response(status, ptr, body.byte_length(), self.server_name)
@@ -80,7 +124,7 @@ struct App(Movable):
         The file is read once into the App's startup arena and never touched
         again — requests are answered from the prebuilt response buffer.
         """
-        var route = self.routes.add(path)
+        var route = self.routes.add_method(METHOD_GET, path)
         if self.arena_used >= self.arena_cap:
             fatal("App arena exhausted; construct with a larger arena_mb")
         var dst: BytePtr = retracked(self.arena) + self.arena_used

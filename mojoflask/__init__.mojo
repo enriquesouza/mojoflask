@@ -45,6 +45,13 @@ from .http import (
 )
 
 from .router import (
+    METHOD_ANY,
+    METHOD_DELETE,
+    METHOD_GET,
+    METHOD_PATCH,
+    METHOD_POST,
+    METHOD_PUT,
+    METHOD_QUERY,
     MAX_ROUTE_SEGS,
     MAX_ROUTES,
     RouteTable,

@@ -23,6 +23,15 @@ from mojoflask.ffi import (
     untrack,
 )
 
+from mojoflask.router import (
+    METHOD_DELETE,
+    METHOD_GET,
+    METHOD_PATCH,
+    METHOD_POST,
+    METHOD_PUT,
+    METHOD_QUERY,
+)
+
 
 comptime CR = UInt8(13)
 comptime LF = UInt8(10)
@@ -30,6 +39,11 @@ comptime SLASH = UInt8(47)
 comptime SPACE = UInt8(32)
 comptime TAB = UInt8(9)
 comptime QMARK = UInt8(63)
+
+comptime LETTER_G = UInt8(71)
+comptime LETTER_P = UInt8(80)
+comptime LETTER_D = UInt8(68)
+comptime LETTER_Q = UInt8(81)
 
 
 comptime HEADER_TAIL = "\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'\r\nReferrer-Policy: strict-origin-when-cross-origin\r\nPermissions-Policy: geolocation=(), microphone=(), camera=()\r\nVary: origin\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Expose-Headers: retry-after\r\nConnection: keep-alive\r\n\r\n"
@@ -266,10 +280,11 @@ def wants_close(p: BytePtr, hs: Int, he: Int, keys: RequestHeaderKeys) -> Bool:
 struct ParsedHead(RegisterPassable):
     """Result of splitting one request head into its routing-relevant parts.
 
-    method_start/method_end bracket the verb (kept for future use — routing
-    currently ignores the method). path_start/path_end bracket the path with
-    any ?query stripped. content_length drives body draining and
-    connection_close records an explicit Connection: close.
+    method_start/method_end bracket the verb; method_code is the router's
+    METHOD_* bit for that verb (0 when unrecognized), computed from the same
+    bytes during the request-line scan — no extra pass. path_start/path_end
+    bracket the path with any ?query stripped. content_length drives body
+    draining and connection_close records an explicit Connection: close.
     """
 
     var method_start: Int
@@ -278,6 +293,53 @@ struct ParsedHead(RegisterPassable):
     var path_end: Int
     var content_length: Int
     var connection_close: Bool
+    var method_code: UInt8
+
+
+def method_code_from_span(p: BytePtr, s: Int, e: Int) -> UInt8:
+    """Router METHOD_* bit for the verb bytes p[s:e); 0 when unrecognized.
+
+    Compares at most six bytes already touched by the request-line scan.
+    Method names are case-sensitive per RFC 7231, so lowercase verbs yield 0
+    and fall to the fallback route resolution like any unknown method.
+    """
+    var n = e - s
+    if n < 3 or n > 6:
+        return UInt8(0)
+    if p[s] == LETTER_G:
+        if n == 3 and p[s + 1] == UInt8(69) and p[s + 2] == UInt8(84):
+            return METHOD_GET
+        return UInt8(0)
+    if p[s] == LETTER_P:
+        if n == 3 and p[s + 1] == UInt8(85) and p[s + 2] == UInt8(84):
+            return METHOD_PUT
+        if n == 4 and p[s + 1] == UInt8(79) and p[s + 2] == UInt8(83) and p[s + 3] == UInt8(84):
+            return METHOD_POST
+        if n == 5 and p[s + 1] == UInt8(65) and p[s + 2] == UInt8(84) and p[s + 3] == UInt8(67) and p[s + 4] == UInt8(72):
+            return METHOD_PATCH
+        return UInt8(0)
+    if p[s] == LETTER_D:
+        if (
+            n == 6
+            and p[s + 1] == UInt8(69)
+            and p[s + 2] == UInt8(76)
+            and p[s + 3] == UInt8(69)
+            and p[s + 4] == UInt8(84)
+            and p[s + 5] == UInt8(69)
+        ):
+            return METHOD_DELETE
+        return UInt8(0)
+    if p[s] == LETTER_Q:
+        if (
+            n == 5
+            and p[s + 1] == UInt8(85)
+            and p[s + 2] == UInt8(69)
+            and p[s + 3] == UInt8(82)
+            and p[s + 4] == UInt8(89)
+        ):
+            return METHOD_QUERY
+        return UInt8(0)
+    return UInt8(0)
 
 
 def parse_request_head(p: BytePtr, start: Int, head_end: Int, keys: RequestHeaderKeys) -> ParsedHead:
@@ -302,6 +364,7 @@ def parse_request_head(p: BytePtr, start: Int, head_end: Int, keys: RequestHeade
             path_end=start,
             content_length=0,
             connection_close=False,
+            method_code=UInt8(0),
         )
     var ps = m1 + 1
     var pe = ps
@@ -320,4 +383,5 @@ def parse_request_head(p: BytePtr, start: Int, head_end: Int, keys: RequestHeade
         path_end=pe,
         content_length=parse_content_length(p, start, head_end, keys),
         connection_close=wants_close(p, start, head_end, keys),
+        method_code=method_code_from_span(p, start, m1),
     )

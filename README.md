@@ -9,8 +9,38 @@ benchmark server.
 
 ## Status
 
-v0.1.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
+v0.2.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
 the poll(2) core is POSIX so porting is mostly FFI constants.
+
+## Usage (App layer)
+
+`App` registers route + prebuilt response together, one verb helper each:
+
+```mojo
+from mojoflask import App
+
+
+def main():
+    var app = App(port=8080)
+    app.get("/health", "{\"status\":\"ok\"}")
+    app.post("/echo-note", "{\"note\":\"received\"}")   # POST-only
+    app.put("/items", "{}")
+    app.patch("/items", "{}")
+    app.delete_route("/items", "{}")                    # DELETE (keyword-safe name)
+    app.fallback("{\"error\":\"not found\"}")           # 404 for misses
+    app.run()
+```
+
+Each verb binds its route to that HTTP method's mask; a request with a
+different verb on the same path falls through to the fallback response.
+`app.get_file(path, file)` and `app.get_status(path, status, body)` stay
+GET-bound. Under the hood routes carry method bitmasks (`METHOD_GET`,
+`METHOD_POST`, `METHOD_PUT`, `METHOD_PATCH`, `METHOD_DELETE`, `METHOD_QUERY`,
+or `METHOD_ANY`), and `RouteTable.add_method(mask, pattern)` exposes them to
+raw-table users while `routes.add(pattern)` keeps accepting any method.
+
+Method codes are computed from the bytes of the existing request-line scan —
+routing stays allocation-free and adds no extra parsing pass.
 
 ## Usage (the Fiber comparison)
 
@@ -75,8 +105,8 @@ that), TLS, HTTP/2 — put nginx/Caddy in front if you need those today.
 | module | role |
 |---|---|
 | `ffi.mojo` | every libc/POSIX touchpoint: sockets, malloc, errno, poll structs, SCM_RIGHTS fd passing. All Darwin quirks documented inline. |
-| `http.mojo` | HTTP/1.1 head parsing (method, path, Content-Length, Connection) and response assembly |
-| `router.mojo` | pattern strings -> segment matchers (`literal`, `{name}` any, `{name:d}` digits); resolution is a linear segment walk, no allocations |
+| `http.mojo` | HTTP/1.1 head parsing (method code, path, Content-Length, Connection) and response assembly |
+| `router.mojo` | pattern strings -> segment matchers (`literal`, `{name}` any, `{name:d}` digits) with per-route method masks; resolution is a linear segment walk, no allocations |
 | `server.mojo` | connection state pool, poll(2) event loop, pre-fork acceptor that round-robins accepted fds to workers over Unix socketpairs, keep-alive state machine |
 
 ### Darwin quirks encoded here (read before porting)
