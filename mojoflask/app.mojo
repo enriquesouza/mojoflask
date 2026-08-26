@@ -30,7 +30,7 @@ from .ffi import (
     retracked,
     untrack,
 )
-from .http import ResponseSet, build_response, response_set
+from .http import ResponseBuffer, ResponseSet, build_response, response_set
 from .router import (
     METHOD_GET,
     METHOD_POST,
@@ -158,14 +158,23 @@ struct App(Movable):
     def dynamic(mut self, mask: UInt8, path: String) -> Int:
         """Register a per-request (dynamic) route; returns its route index.
 
-        No ResponseBuffer is prebuilt or consumed. When a request matches,
-        the engine invokes THE process resolver with the raw request
-        head/body spans; the resolver answers with fresh bytes or a
-        static_route fast-return. Run the app through run_dynamic[resolver]
-        so that resolver is attached; under plain run() matching this route
-        serves the fallback response.
+        The route consumes a PLACEHOLDER response slot (a zero-length buffer
+        that is never served — the engine answers matched dynamic routes
+        through the resolver or the fallback, never this slot), so route and
+        response indexes stay in lockstep for every static route registered
+        after it. When a request matches, the engine invokes THE process
+        resolver with the raw request head/body spans; the resolver answers
+        with fresh bytes or a static_route fast-return. Run the app through
+        run_dynamic[resolver] so that resolver is attached; under plain run()
+        matching this route serves the fallback response.
         """
-        return self.routes.add_dynamic(mask, path)
+        var route = self.routes.add_dynamic(mask, path)
+        var placeholder: BytePtr = make_cstr("")
+        _ = self.responses.add(
+            build_response("200 OK", placeholder, 0, self.server_name)
+        )
+        free_bytes(placeholder)
+        return route
 
     def _register_file(
         mut self, mask: UInt8, path: String, status: String, file_path: String
