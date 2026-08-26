@@ -4,8 +4,10 @@ Public API
     App / app_from_env()          the high-level builder: app.get(...), app.run()
     RouteTable / route_table()   declare routes as pattern strings at startup
     ResponseBuffer / build_response()
-                                 prebuild whole responses once, serve by pointer
+                                  prebuild whole responses once, serve by pointer
     response_set()               route-indexed table of prebuilt responses
+    ParsedBody / parse_json_body()
+                                  EmberJson-backed flat request-body decoding
     WorkerConfig / worker_config_from_env()
     serve(config, routes, responses)
                                  bind + fork + poll event loop, never returns
@@ -15,6 +17,8 @@ start with mojoflask.server for the SO_REUSEPORT/SCM_RIGHTS story.
 """
 
 from .app import App, app_from_env
+
+from .bodyjson import ParsedBody, parse_json_body
 
 from .ffi import (
     BytePtr,

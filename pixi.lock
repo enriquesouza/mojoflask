@@ -54,10 +54,11 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/tornado-6.5.8-py314h6c2aa35_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zeromq-4.3.5-h10816f8_11.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
-      - conda: https://conda.modular.com/max-nightly/noarch/mblack-26.6.0.dev2026082505-release.conda
-      - conda: https://conda.modular.com/max-nightly/noarch/mojo-python-1.1.0.dev2026082505-release.conda
-      - conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-1.1.0.dev2026082505-release.conda
-      - conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-compiler-1.1.0.dev2026082505-release.conda
+      - conda: https://conda.modular.com/max-nightly/noarch/mblack-26.5.0-release.conda
+      - conda: https://conda.modular.com/max-nightly/noarch/mojo-python-1.0.0-release.conda
+      - conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-1.0.0-release.conda
+      - conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-compiler-1.0.0-release.conda
+      - conda: https://repo.prefix.dev/modular-community/osx-arm64/emberjson-0.3.4-h60d57d3_0.conda
 packages:
 - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
   sha256: 2a7204314663eeda5dec482a956f0e2eaf289bd5b9953eaaaad0e81aa64638f2
@@ -556,10 +557,10 @@ packages:
     - zstd >=1.5.7,<1.6.0a0
   size: 433687
   timestamp: 1786599629846
-- conda: https://conda.modular.com/max-nightly/noarch/mblack-26.6.0.dev2026082505-release.conda
+- conda: https://conda.modular.com/max-nightly/noarch/mblack-26.5.0-release.conda
   noarch: python
-  sha256: a24f1214357d0472c2acfccaa65b3f1b8bdb29ba0d90edc9a1bde5846519573d
-  md5: e84e73173c4cf4e7e802c4d06541e60c
+  sha256: 49102b55366eab56b04620533302b8693b4fa4a6c5972b3cc978b3f3bad83ebe
+  md5: 0cbfc119215c063cd279f0a6beb04285
   depends:
   - python >=3.10
   - click >=8.0.0
@@ -570,36 +571,45 @@ packages:
   - tomli >=1.1.0
   license: LicenseRef-Modular-Proprietary
   run_exports: {}
-  size: 138086
-  timestamp: 1787635230030
-- conda: https://conda.modular.com/max-nightly/noarch/mojo-python-1.1.0.dev2026082505-release.conda
+  size: 137187
+  timestamp: 1786151006088
+- conda: https://conda.modular.com/max-nightly/noarch/mojo-python-1.0.0-release.conda
   noarch: python
-  sha256: e8d82101d01839ef638e9db6f8d7e2bcdf139ea3412b69c2b8d5c9cd51834406
-  md5: 952681036ebbcfb188d4dc91ada2bae2
+  sha256: fc449a47c7707ed96a794768e29d5d2b0bf7afab373e2a9751f281ed7c4f822c
+  md5: 4a27e1596a5c2d27330a2377090b12c5
   depends:
   - python >=3.10
   license: LicenseRef-Modular-Proprietary
   run_exports: {}
-  size: 24217
-  timestamp: 1787635229901
-- conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-1.1.0.dev2026082505-release.conda
-  sha256: 83d4916f7cbcf9c8cad34d3acb58691bb9afe218a2800339400c841d2a2f6212
-  md5: 48690db69e5c1102bb2e446fe69bc9cf
+  size: 24040
+  timestamp: 1785891558838
+- conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-1.0.0-release.conda
+  sha256: 200bd9ace6e06ad2a9b4f4cce9afa3e5f3c00b3d87a6d57206249df2a5568e38
+  md5: 954433eb905b424cc3d4325c9c2242de
   depends:
   - python >=3.10
-  - mojo-compiler ==1.1.0.dev2026082505
-  - mblack ==26.6.0.dev2026082505
+  - mojo-compiler ==1.0.0
+  - mblack ==26.5.0
   - jupyter_client >=8.6.2,<8.7
   license: LicenseRef-Modular-Proprietary
   run_exports: {}
-  size: 102133300
-  timestamp: 1787635589362
-- conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-compiler-1.1.0.dev2026082505-release.conda
-  sha256: abaa42ad06fc62554d7e223696a78822b1b1d0409f4e533432a17998ba4b7234
-  md5: c38cf1fe0482342033b9013869a23648
+  size: 101155040
+  timestamp: 1786294689438
+- conda: https://conda.modular.com/max-nightly/osx-arm64/mojo-compiler-1.0.0-release.conda
+  sha256: c52054bc444d851e5c38cc33e790fb011a1080470244aaa59351ac5056d08c59
+  md5: b5103c9d9978173a1e97c5e5eed1aeba
   depends:
-  - mojo-python ==1.1.0.dev2026082505
+  - mojo-python ==1.0.0
   license: LicenseRef-Modular-Proprietary
   run_exports: {}
-  size: 61830409
-  timestamp: 1787635586409
+  size: 61221085
+  timestamp: 1786294690001
+- conda: https://repo.prefix.dev/modular-community/osx-arm64/emberjson-0.3.4-h60d57d3_0.conda
+  sha256: be33b692fbf80a21547155109c39443329d6575288da8d1667e4f6e3acb74168
+  md5: 14260ff57c0f9ba3f1f256bbe29ec274
+  depends:
+  - mojo-compiler >=1.0.0,<2.0a0
+  license: Apache-2.0
+  run_exports: {}
+  size: 10337220
+  timestamp: 1787047028195

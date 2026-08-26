@@ -5,7 +5,7 @@ preview = ["pixi-build"]
 description = "Zero-per-request-allocation HTTP server library for Mojo 1.0"
 name = "mojoflask"
 platforms = ["osx-arm64"]
-version = "0.2.1"
+version = "0.3.0"
 license = "MIT"
 license-file = "LICENSE"
 readme = "README.md"
@@ -18,20 +18,23 @@ run-example = "./hello"
 precompile = "mojo precompile mojoflask -o mojoflask.mojoc"
 
 [dependencies]
-mojo = ">=1.0.0"
+mojo = "=1.0.0"
+emberjson = ">=0.3.4,<0.4"
 
 [package]
 name = "mojoflask"
-version = "0.2.1"
+version = "0.3.0"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
 
 [package.host-dependencies]
-mojo-compiler = ">=1.0.0"
+mojo-compiler = "=1.0.0"
 
 [package.build-dependencies]
-mojo-compiler = ">=1.0.0"
+mojo-compiler = "=1.0.0"
+emberjson = ">=0.3.4,<0.4"
 
 [package.run-dependencies]
-mojo-compiler = ">=1.0.0"
+mojo-compiler = "=1.0.0"
+emberjson = ">=0.3.4,<0.4"

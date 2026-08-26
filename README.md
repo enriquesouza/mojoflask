@@ -9,7 +9,7 @@ benchmark server.
 
 ## Status
 
-v0.2.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
+v0.3.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
 the poll(2) core is POSIX so porting is mostly FFI constants.
 
 ## Usage (App layer)
@@ -45,6 +45,26 @@ raw-table users while `routes.add(pattern)` keeps accepting any method.
 
 Method codes are computed from the bytes of the existing request-line scan —
 routing stays allocation-free and adds no extra parsing pass.
+
+## Usage (request bodies)
+
+`parse_json_body` decodes a flat JSON body into a `ParsedBody` register struct
+using [EmberJson](https://github.com/bgreni/EmberJson). Unknown keys are
+ignored, missing keys keep their defaults (`limit=12`, `page=1`, lat/lng `0`,
+`has_geo=False`, `ok=False`), numbers-as-strings are accepted, and any
+malformed payload or non-object document yields the defaults with `ok=False`.
+
+```mojo
+from mojoflask import BytePtr, parse_json_body
+
+def handle(body: BytePtr, body_len: Int) -> Int:
+    var b = parse_json_body(body, body_len)
+    if not b.ok:
+        return 400
+    if b.has_geo:
+        return b.limit * (Int(b.lat) + 1)
+    return b.limit * b.page
+```
 
 ## Usage (the Fiber comparison)
 
@@ -108,6 +128,7 @@ that), TLS, HTTP/2 — put nginx/Caddy in front if you need those today.
 
 | module | role |
 |---|---|
+| `bodyjson.mojo` | EmberJson-backed flat request-body decoding into a register struct; ASCII scanners cover numbers-as-strings |
 | `ffi.mojo` | every libc/POSIX touchpoint: sockets, malloc, errno, poll structs, SCM_RIGHTS fd passing. All Darwin quirks documented inline. |
 | `http.mojo` | HTTP/1.1 head parsing (method code, path, Content-Length, Connection) and response assembly |
 | `router.mojo` | pattern strings -> segment matchers (`literal`, `{name}` any, `{name:d}` digits) with per-route method masks; resolution is a linear segment walk, no allocations |
@@ -128,12 +149,22 @@ that), TLS, HTTP/2 — put nginx/Caddy in front if you need those today.
 
 ```
 mojoflask/__init__.mojo   public API surface
+mojoflask/bodyjson.mojo   request-body JSON (EmberJson)
 mojoflask/ffi.mojo        libc layer (the only ugly file, quarantined)
 mojoflask/http.mojo       parsing + assembly
 mojoflask/router.mojo     RouteTable
 mojoflask/server.mojo     event loop + workers + serve()
 examples/hello.mojo           minimal app
 ```
+
+### Dependency note
+
+The `emberjson` dependency comes from the prebuilt package on the
+`modular-community` conda channel (same 0.3.4 tag as upstream). Building it as
+a nested pixi git dependency (`git = ".../EmberJson.git", tag = "0.3.4"`)
+currently fails: EmberJson's source does not compile under a source build in
+this workspace (`InlineArray` unknown declaration + deprecation errors in its
+`_deserialize` modules), so the prebuilt artifact is used instead.
 
 ## Roadmap
 
