@@ -10,6 +10,14 @@ Role
     insert time (`set`). The table is single-threaded by design, matching the
     per-process cache in the Go reference (one table per forked worker).
 
+Ownership contract
+    Every entry carries an `own` flag. Buffers inserted with own=True are
+    OWNED BY THE TABLE: `set` frees the previously-owned buffer when it
+    replaces a slot, so consumers may hand table-owned bytes out by borrow
+    (DynamicOut owns=False) for as long as no later `set` overwrites that
+    slot. Entries built at seed time and on cache misses must be inserted
+    with owns=True; borrowed/static buffers go in with owns=False.
+
 Grid rounding contract
     `round3_half_away` implements Go `math.Round(v*1000)/1000`: halfway cases
     go AWAY from zero. Because the multiply happens in IEEE-754 float64, the
@@ -40,6 +48,7 @@ from std.origin import UntrackedOrigin
 
 comptime UntrackedBytePtr = Pointer[T=Byte, mut=True, origin=UntrackedOrigin[mut=True]]
 comptime UntrackedIntPtr = Pointer[T=Int, mut=True, origin=UntrackedOrigin[mut=True]]
+comptime UntrackedBoolPtr = Pointer[T=Bool, mut=True, origin=UntrackedOrigin[mut=True]]
 comptime FNV_OFFSET = UInt64(14695981039346656037)
 comptime FNV_PRIME = UInt64(1099511628211)
 comptime DEFAULT_CAPACITY = 4096
@@ -198,7 +207,8 @@ struct SlotTable:
     """Open-addressed-by-hash-slot cache of prebuilt responses.
 
     Parallel arrays sized once at construction: inline key copies (512 bytes
-    per slot), key lengths, expiry stamps (monotonic ns; 0 = never), and the
+    per slot), key lengths, expiry stamps (monotonic ns; 0 = never), own
+    flags (see the ownership contract in the module docstring), and the
     response buffers themselves. Lookups take the low bits of the FNV hash as
     the slot, confirm with a full-key compare, and check TTL. Expired entries
     are treated as misses but left in place — the next `set` overwrites them.
@@ -212,6 +222,7 @@ struct SlotTable:
     var keys: UntrackedBytePtr
     var key_lens: UntrackedIntPtr
     var expiry: UntrackedIntPtr
+    var owns: UntrackedBoolPtr
     var values: List[ResponseBuffer]
 
     def __init__(out self, capacity_request: Int, ttl_ns: Int):
@@ -226,12 +237,16 @@ struct SlotTable:
         self.keys = untrack(malloc_bytes(cap * KEY_CAP))
         self.key_lens = UntrackedIntPtr(unsafe_from_address=Int(malloc_bytes(8 * cap)))
         self.expiry = UntrackedIntPtr(unsafe_from_address=Int(malloc_bytes(8 * cap)))
+        self.owns = UntrackedBoolPtr(
+            unsafe_from_address=Int(malloc_bytes(cap))
+        )
         self.values = List[ResponseBuffer]()
         var miss = ResponseBuffer(data=null_bytes(), length=0)
         var i = 0
         while i < cap:
             self.key_lens[i] = 0
             self.expiry[i] = 0
+            self.owns[i] = False
             self.values.append(miss)
             i += 1
 
@@ -254,16 +269,30 @@ struct SlotTable:
             i += 1
         return self.values[idx]
 
-    def set(mut self, h: UInt64, key: BytePtr, klen: Int, value: ResponseBuffer):
+    def set(
+        mut self,
+        h: UInt64,
+        key: BytePtr,
+        klen: Int,
+        value: ResponseBuffer,
+        value_owned: Bool,
+    ):
         """Insert/overwrite the slot for this hash+key, copying the key bytes.
 
         This is the only place the cache allocates per call (the key copy).
         With ttl_ns <= 0 entries never expire; otherwise the stamp is
-        monotonic-now + ttl_ns.
+        monotonic-now + ttl_ns. When the overwritten entry was inserted with
+        owns=True its buffer is freed HERE — see the ownership contract in
+        the module docstring; callers must never keep serving bytes from a
+        slot they are about to overwrite.
         """
         if klen > KEY_CAP:
+            if value_owned and Int(value.length) > 0:
+                free_bytes(retracked(value.data))
             return
         var idx = Int(h & self.mask)
+        if self.owns[idx] and Int(self.values[idx].length) > 0:
+            free_bytes(retracked(self.values[idx].data))
         var base = self.keys + idx * KEY_CAP
         var i = 0
         while i < klen:
@@ -271,6 +300,7 @@ struct SlotTable:
             i += 1
         self.key_lens[idx] = klen
         self.values[idx] = value
+        self.owns[idx] = value_owned
         if self.ttl_ns > 0:
             self.expiry[idx] = _now_ns() + self.ttl_ns
         else:
