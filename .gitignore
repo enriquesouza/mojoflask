@@ -3,3 +3,4 @@
 hello
 __pycache__/
 .DS_Store
+*.conda
