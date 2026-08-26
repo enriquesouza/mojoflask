@@ -45,9 +45,12 @@ from .ffi import (
     htons,
     make_cstr,
     malloc_bytes,
+    null_bytes,
     read_file_into,
     recv_fd,
+    retracked,
     send_fd,
+    untrack,
 )
 
 from .http import (
@@ -71,6 +74,8 @@ from .router import (
     METHOD_QUERY,
     MAX_ROUTE_SEGS,
     MAX_ROUTES,
+    ROUTE_DYNAMIC,
+    ROUTE_STATIC,
     RouteTable,
     route_table,
 )
@@ -78,9 +83,12 @@ from .router import (
 from .server import (
     DEFAULT_BUF_CAP,
     DEFAULT_MAX_CONNS,
+    DynamicOut,
+    ResolverFn,
     WorkerConfig,
     conn_table,
     serve,
+    serve_dynamic,
     worker_config,
     worker_config_from_env,
 )

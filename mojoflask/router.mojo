@@ -53,6 +53,9 @@ comptime SEG_LITERAL = UInt8(0)
 comptime SEG_WILDCARD = UInt8(1)
 comptime SEG_DIGITS = UInt8(2)
 
+comptime ROUTE_STATIC = UInt8(0)
+comptime ROUTE_DYNAMIC = UInt8(1)
+
 comptime SLASH = UInt8(47)
 comptime DIGIT_LO = UInt8(48)
 comptime DIGIT_HI = UInt8(57)
@@ -89,6 +92,11 @@ struct RouteTable(RegisterPassable, ImplicitlyCopyable):
     all-bits METHOD_ANY); resolution only accepts routes whose mask admits the
     request's method code. Routes registered through `add` keep mask ANY, so
     method-less tables behave exactly as before masks existed.
+
+    Every route also carries a kind: ROUTE_STATIC (registered through add /
+    add_method; backed by a prebuilt ResponseBuffer) or ROUTE_DYNAMIC
+    (registered through add_dynamic; dispatched to the process resolver at
+    request time). The server consults kind_at() after resolve_method().
     """
 
     var count: Int
@@ -97,6 +105,7 @@ struct RouteTable(RegisterPassable, ImplicitlyCopyable):
         T=RouteMatcher, mut=True, origin=UntrackedOrigin[mut=True]
     ]
     var method_masks: Pointer[T=UInt8, mut=True, origin=UntrackedOrigin[mut=True]]
+    var kinds: Pointer[T=UInt8, mut=True, origin=UntrackedOrigin[mut=True]]
 
     def add(mut self, pattern: String) -> Int:
         """Compile one pattern into matchers; returns its registration index.
@@ -109,12 +118,32 @@ struct RouteTable(RegisterPassable, ImplicitlyCopyable):
         return self.add_method(METHOD_ANY, pattern)
 
     def add_method(mut self, method_mask: UInt8, pattern: String) -> Int:
-        """Compile one pattern bound to `method_mask`; returns its index.
+        """Compile one static route bound to `method_mask`; returns its index.
 
         The mask is one or more METHOD_* bits OR-ed together; matching later
         requires the request's method code to share at least one bit. A mask
-        of METHOD_ANY restores unconditional acceptance.
+        of METHOD_ANY restores unconditional acceptance. Static routes are
+        answered from a prebuilt ResponseBuffer; register those in the paired
+        ResponseSet at the returned index.
         """
+        return self._compile(method_mask, pattern, ROUTE_STATIC)
+
+    def add_dynamic(mut self, method_mask: UInt8, pattern: String) -> Int:
+        """Compile one dynamic route bound to `method_mask`; returns its index.
+
+        Dynamic routes match exactly like static ones but consume NO
+        ResponseSet slot: at request time the server hands the raw request
+        head/body spans to the single process resolver (see mojoflask.server,
+        ResolverFn), which must be installed before serve(). If no resolver is
+        installed when a dynamic route matches, the fallback response is
+        served instead.
+        """
+        return self._compile(method_mask, pattern, ROUTE_DYNAMIC)
+
+    def _compile(
+        mut self, method_mask: UInt8, pattern: String, kind: UInt8
+    ) -> Int:
+        """Shared pattern compiler for add_method/add_dynamic."""
         var route = self.count
         if route >= MAX_ROUTES:
             fatal("route limit exceeded")
@@ -139,8 +168,15 @@ struct RouteTable(RegisterPassable, ImplicitlyCopyable):
             fatal("empty route pattern")
         self.seg_counts[route] = Int32(seg)
         self.method_masks[route] = method_mask
+        self.kinds[route] = kind
         self.count += 1
         return route
+
+    def kind_at(self, route_index: Int) -> UInt8:
+        """ROUTE_STATIC or ROUTE_DYNAMIC for a registered route index."""
+        if route_index < 0 or route_index >= self.count:
+            return ROUTE_STATIC
+        return self.kinds[route_index]
 
     def resolve(self, p: BytePtr, ps: Int, pe: Int) -> Int:
         """Index of the first route matching path p[ps:pe), else -1.
@@ -207,6 +243,9 @@ def route_table() -> RouteTable:
             unsafe_from_address=Int(malloc_bytes(24 * MAX_ROUTES * MAX_ROUTE_SEGS))
         ),
         method_masks=Pointer[T=UInt8, mut=True, origin=UntrackedOrigin[mut=True]](
+            unsafe_from_address=Int(malloc_bytes(MAX_ROUTES))
+        ),
+        kinds=Pointer[T=UInt8, mut=True, origin=UntrackedOrigin[mut=True]](
             unsafe_from_address=Int(malloc_bytes(MAX_ROUTES))
         ),
     )

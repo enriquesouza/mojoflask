@@ -23,13 +23,54 @@ Darwin quirks encoded here (all verified against macOS 26 arm64)
 
 Connection lifecycle (ConnState.phase)
     PARSE_HEAD     -> accumulate bytes until CRLFCRLF; resolve route, latch
-                      the prebuilt response, note Content-Length and any
-                      explicit Connection: close.
+                      the prebuilt response (or mark the route dynamic), note
+                      Content-Length and any explicit Connection: close.
     READ_BODY      -> drain request body bytes (QUERY/POST) before replying;
-                      once drained, aim the writer at the prebuilt response
-                      and fall through to flushing.
-    WRITE_RESPONSE -> send() slices of the response until done; then either
-                      keep-alive back to PARSE_HEAD or close the socket.
+                      once drained, dynamic routes invoke the process
+                      resolver while static routes aim the writer at the
+                      prebuilt response; both fall through to flushing.
+    WRITE_RESPONSE -> send() slices of the latched response until done; then
+                      either keep-alive back to PARSE_HEAD or close the
+                      socket.
+
+Dynamic routes and the single process resolver
+    Mojo 1.0 forbids module-level mutable globals ("global variables are not
+    supported") AND storing function values inside struct fields ("struct
+    fields do not support trait types"), so a runtime set_resolver(f) cell is
+    impossible in-language. The single-per-process hook therefore travels as
+    a COMPTIME parameter: register dynamic routes, then enter the loop with
+    serve_dynamic[resolve](config, routes, responses) (App: run_dynamic[...])
+    — exactly one resolver per process tree, inherited by every forked
+    worker, installed before any request is served. Static-only apps keep
+    plain run()/serve(), whose hot path never touches the resolver.
+
+    When a resolved route's kind is ROUTE_DYNAMIC, the engine waits until the
+    head AND body are fully read, then calls the resolver once with:
+
+      - route_index  which add_dynamic() registration matched
+      - method_code  the request's METHOD_* bit (0 when unrecognized)
+      - req_head/head_len   span of the full request head inside the
+                            connection's receive buffer
+      - body/body_len       span of the drained request body (may be empty)
+
+    ALIASING HAZARD: both spans point INTO the connection recv buffer, which
+    is reused for the next request as soon as the response write completes —
+    the handler MUST copy anything it retains past its return.
+
+    The resolver answers through one DynamicOut mutable argument:
+
+      - static_route >= 0  serve responses.at(static_route) instead — the
+        fast-return idiom lets a handler answer warm-cache hits from an
+        existing prebuilt buffer with zero allocation; data/length are then
+        ignored.
+      - otherwise data/length describe fresh response bytes (a complete
+        HTTP/1.x message including headers). owns=True makes the engine
+        free() data after the write finishes or the connection dies;
+        owns=False means the handler keeps ownership. Returning True with an
+        empty payload, or returning False, serves the fallback response.
+
+    Serving a dynamic route under plain serve() (no resolver) serves the
+    fallback response — never a crash.
 """
 
 from std.os import getenv
@@ -44,6 +85,7 @@ from mojoflask.ffi import (
     POLLNVAL,
     POLLOUT,
     PollFd,
+    BytePtr,
     Int32Ptr,
     UntrackedBytePtr,
     UntrackedInt32Ptr,
@@ -81,7 +123,7 @@ from mojoflask.http import (
     standard_header_keys,
 )
 
-from mojoflask.router import RouteTable
+from mojoflask.router import ROUTE_DYNAMIC, RouteTable
 
 
 comptime PHASE_PARSE_HEAD = 0
@@ -98,7 +140,37 @@ comptime RESERVED_FD_GUARDS = 96
 
 # Padded per-slot stride for the heap allocation backing ConnTable; generous
 # on purpose so field additions never under-allocate.
-comptime CONN_SLOT_STRIDE = 128
+comptime CONN_SLOT_STRIDE = 192
+
+
+# One process-wide dynamic-route resolver (full contract in the module
+# docstring). Because Mojo 1.0 cannot store function values in fields or
+# globals, it travels as a comptime parameter through serve_dynamic[] /
+# run_dynamic[]. Arguments: route_index, method_code, req_head, head_len,
+# body, body_len, plus one mutable DynamicOut the handler fills. Return True
+# to accept out_buf (static_route fast-return or fresh owned/borrowed bytes),
+# False to serve the fallback response.
+comptime ResolverFn = def(
+    Int, UInt8, BytePtr, Int, BytePtr, Int, mut DynamicOut
+) thin -> Bool
+
+
+@fieldwise_init
+struct DynamicOut(RegisterPassable):
+    """What a dynamic resolver hands back to the engine.
+
+    static_route >= 0 wins over data/length: the engine serves that prebuilt
+    ResponseBuffer with zero allocation (warm-cache-hit idiom). Otherwise
+    data/length must describe a complete HTTP response message; owns=True
+    transfers free() responsibility to the engine after the write finishes or
+    the connection dies. `data` is untracked for field storage exactly like
+    ResponseBuffer.data.
+    """
+
+    var data: UntrackedBytePtr
+    var length: Int
+    var owns: Bool
+    var static_route: Int
 
 
 @fieldwise_init
@@ -133,6 +205,13 @@ struct ConnState(RegisterPassable, ImplicitlyCopyable):
     var resp_len: Int32
     var write_off: Int32
     var write_remaining: Int32
+    var dyn_route: Int32
+    var req_method: Int32
+    var head_span: Int32
+    var body_span: Int32
+    var dyn_data: UntrackedBytePtr
+    var dyn_len: Int32
+    var dyn_owned: Bool
 
 
 @fieldwise_init
@@ -146,11 +225,25 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
     var poll_map: UntrackedInt32Ptr
 
     def close_conn(mut self, i: Int):
-        """Tear down slot i; keep its recv buffer allocated for reuse."""
+        """Tear down slot i; release any dynamic payload, keep recv buffer."""
+        self.release_dynamic(i)
         var fd = self.slots[i].fd
         if Int(fd) >= 0:
             close_fd(fd)
         self.slots[i].fd = Int32(-1)
+
+    def release_dynamic(mut self, i: Int):
+        """Free a resolver-produced response buffer the engine owns.
+
+        Runs when the write finishes or the connection dies; clears the slot's
+        dynamic fields so keep-alive requests never see stale pointers.
+        """
+        if self.slots[i].dyn_owned and Int(self.slots[i].dyn_len) > 0:
+            free_bytes(retracked(self.slots[i].dyn_data))
+        self.slots[i].dyn_data = null_bytes()
+        self.slots[i].dyn_len = Int32(0)
+        self.slots[i].dyn_owned = False
+        self.slots[i].dyn_route = Int32(-1)
 
     def find_free_slot(self) -> Int:
         """First empty slot index, or -1 when the pool is full."""
@@ -179,6 +272,13 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         self.slots[slot].resp_len = Int32(0)
         self.slots[slot].write_off = Int32(0)
         self.slots[slot].write_remaining = Int32(0)
+        self.slots[slot].dyn_route = Int32(-1)
+        self.slots[slot].req_method = Int32(0)
+        self.slots[slot].head_span = Int32(0)
+        self.slots[slot].body_span = Int32(0)
+        self.slots[slot].dyn_data = null_bytes()
+        self.slots[slot].dyn_len = Int32(0)
+        self.slots[slot].dyn_owned = False
 
     def flush_write(mut self, i: Int):
         """Send more of the latched response; finish or keep-alive on completion."""
@@ -198,13 +298,20 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         self.slots[i].write_off = self.slots[i].write_off + Int32(Int(n))
         self.slots[i].write_remaining = self.slots[i].write_remaining - Int32(Int(n))
         if Int(self.slots[i].write_remaining) == 0 and Int(self.slots[i].phase) == PHASE_WRITE_RESPONSE:
+            self.release_dynamic(i)
             if self.slots[i].wants_close:
                 self.close_conn(i)
             else:
                 self.slots[i].phase = Int32(PHASE_PARSE_HEAD)
                 self.slots[i].wants_close = False
 
-    def advance_state(mut self, routes: RouteTable, responses: ResponseSet, keys: RequestHeaderKeys, i: Int):
+    def advance_state[resolve: ResolverFn](
+        mut self,
+        routes: RouteTable,
+        responses: ResponseSet,
+        keys: RequestHeaderKeys,
+        i: Int,
+    ):
         """Run one connection's state machine as far as buffered bytes allow.
 
         Invariant: `moved` restarts the machine whenever a phase made
@@ -233,7 +340,18 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                 var route_idx = routes.resolve_method(
                     buf, head.path_start, head.path_end, head.method_code
                 )
-                var chosen = responses.at(route_idx)
+                if route_idx >= 0 and routes.kind_at(route_idx) == ROUTE_DYNAMIC:
+                    self.slots[i].dyn_route = Int32(route_idx)
+                else:
+                    self.slots[i].dyn_route = Int32(-1)
+                self.slots[i].req_method = Int32(head.method_code)
+                self.slots[i].head_span = Int32((hend + 4) - off)
+                self.slots[i].body_span = Int32(head.content_length)
+                var chosen: ResponseBuffer
+                if Int(self.slots[i].dyn_route) >= 0:
+                    chosen = responses.at(-1)
+                else:
+                    chosen = responses.at(route_idx)
                 self.slots[i].resp_data = chosen.data
                 self.slots[i].resp_len = Int32(chosen.length)
                 self.slots[i].body_remaining = Int32(head.content_length)
@@ -253,8 +371,14 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                     moved = True
                 if Int(self.slots[i].body_remaining) > 0:
                     break
-                # body -> write: request fully consumed; first flush happens
-                # inline so tiny responses leave without another poll cycle.
+                # body -> write: request fully consumed; dynamic routes get
+                # one resolver shot at replacing the latched fallback, then
+                # the first flush happens inline so tiny responses leave
+                # without another poll cycle.
+                if Int(self.slots[i].dyn_route) >= 0:
+                    self.dispatch_dynamic[resolve](responses, i, buf)
+                    if Int(self.slots[i].fd) < 0:
+                        return
                 self.slots[i].write_off = Int32(0)
                 self.slots[i].write_remaining = self.slots[i].resp_len
                 self.slots[i].phase = Int32(PHASE_WRITE_RESPONSE)
@@ -265,6 +389,48 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                     break
                 moved = True
         self.normalize_buffer(i)
+
+    def dispatch_dynamic[resolve: ResolverFn](
+        mut self, responses: ResponseSet, i: Int, buf: BytePtr
+    ):
+        """Run the process resolver for slot i's just-consumed request.
+
+        The head span and body span are recovered backwards from buf_off,
+        which stays exact across any normalize_buffer() compaction because
+        compaction shifts the whole request uniformly. On success the write
+        targets are re-aimed at either a prebuilt buffer (static_route
+        fast-return) or fresh resolver bytes (ownership tracked in dyn_owned);
+        on any failure the latched fallback response stands.
+        """
+        var end = Int(self.slots[i].buf_off)
+        var total = Int(self.slots[i].head_span) + Int(self.slots[i].body_span)
+        if total <= 0 or total > end:
+            return
+        var hs = end - total
+        var he = hs + Int(self.slots[i].head_span)
+        var out_buf = DynamicOut(data=null_bytes(), length=0, owns=False, static_route=-1)
+        var ok = resolve(
+            Int(self.slots[i].dyn_route),
+            UInt8(Int(self.slots[i].req_method) & 0xFF),
+            buf + hs,
+            Int(self.slots[i].head_span),
+            buf + he,
+            Int(self.slots[i].body_span),
+            out_buf,
+        )
+        if not ok:
+            return
+        if out_buf.static_route >= 0:
+            var pre = responses.at(out_buf.static_route)
+            self.slots[i].resp_data = pre.data
+            self.slots[i].resp_len = Int32(pre.length)
+            return
+        if out_buf.length > 0:
+            self.slots[i].dyn_data = out_buf.data
+            self.slots[i].dyn_len = Int32(out_buf.length)
+            self.slots[i].dyn_owned = out_buf.owns
+            self.slots[i].resp_data = out_buf.data
+            self.slots[i].resp_len = Int32(out_buf.length)
 
     def normalize_buffer(self, i: Int):
         """Compact the receive buffer so offsets never march past buf_cap."""
@@ -280,7 +446,13 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                 k += 1
             self.slots[i].buf_off = Int32(0)
 
-    def handle_readable(mut self, routes: RouteTable, responses: ResponseSet, keys: RequestHeaderKeys, i: Int):
+    def handle_readable[resolve: ResolverFn](
+        mut self,
+        routes: RouteTable,
+        responses: ResponseSet,
+        keys: RequestHeaderKeys,
+        i: Int,
+    ):
         """Read whatever arrived and push the state machine forward."""
         if Int(self.slots[i].fd) < 0:
             return
@@ -288,7 +460,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         var buf = retracked(self.slots[i].recv_buf)
         var used = Int(self.slots[i].buf_off) + Int(self.slots[i].data_len)
         if used >= self.buf_cap:
-            self.advance_state(routes, responses, keys, i)
+            self.advance_state[resolve](routes, responses, keys, i)
             if Int(self.slots[i].fd) < 0:
                 return
             if (Int(self.slots[i].buf_off) + Int(self.slots[i].data_len)) >= self.buf_cap:
@@ -305,7 +477,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
             self.close_conn(i)
             return
         self.slots[i].data_len = self.slots[i].data_len + Int32(Int(n))
-        self.advance_state(routes, responses, keys, i)
+        self.advance_state[resolve](routes, responses, keys, i)
 
 
 def worker_config(port: Int, workers: Int) -> WorkerConfig:
@@ -359,6 +531,13 @@ def conn_table(config: WorkerConfig) -> ConnTable:
         resp_len=Int32(0),
         write_off=Int32(0),
         write_remaining=Int32(0),
+        dyn_route=Int32(-1),
+        req_method=Int32(0),
+        head_span=Int32(0),
+        body_span=Int32(0),
+        dyn_data=null_bytes(),
+        dyn_len=Int32(0),
+        dyn_owned=False,
     )
     var j = 0
     while j < capacity:
@@ -388,51 +567,6 @@ def reserve_low_descriptors():
         g += 1
 
 
-def serve(config: WorkerConfig, routes: RouteTable, responses: ResponseSet):
-    """Bind, optionally fork SCM_RIGHTS-fanned-out workers, and serve forever.
-
-    Callers must build `routes` and `responses` BEFORE calling serve(): the
-    forks below copy-on-write share those prebuilt buffers across workers,
-    which is what keeps summed RSS low.
-    """
-    ignore_sigpipe()
-    reserve_low_descriptors()
-
-    var listener = create_listen_socket(config.port, config.backlog)
-    if Int(listener) < 0:
-        fatal("listen socket failed")
-
-    var keys = standard_header_keys()
-
-    if config.workers > 1:
-        var pairs = malloc_int32s(2 * config.workers)
-        var k = 0
-        while k < config.workers:
-            var sp = malloc_int32s(2)
-            sp[0] = Int32(-1)
-            sp[1] = Int32(-1)
-            socketpair(sp)
-            pairs[k * 2] = sp[0]
-            pairs[k * 2 + 1] = sp[1]
-            k += 1
-        var my_pair = Int32(-1)
-        var k2 = 0
-        while k2 < config.workers:
-            var child_pid = fork_process()
-            if Int(child_pid) == 0:
-                my_pair = pairs[k2 * 2 + 1]
-                break
-            if Int(child_pid) < 0:
-                break
-            k2 += 1
-        if Int(my_pair) < 0:
-            acceptor_forever(listener, pairs, config.workers)
-            return
-        worker_loop(listener, my_pair, config, routes, responses, keys)
-        return
-    worker_loop(listener, Int32(-1), config, routes, responses, keys)
-
-
 def acceptor_forever(listener: Int32, pairs: Int32Ptr, worker_count: Int):
     """Parent-side acceptor: hand every new fd to workers round-robin."""
     var next_worker = 0
@@ -450,7 +584,7 @@ def acceptor_forever(listener: Int32, pairs: Int32Ptr, worker_count: Int):
         next_worker += 1
 
 
-def worker_loop(
+def worker_loop[resolve: ResolverFn](
     listener: Int32,
     pair_fd: Int32,
     config: WorkerConfig,
@@ -508,5 +642,95 @@ def worker_loop(
                             conns.flush_write(idx)
                         if Int(conns.slots[idx].fd) >= 0:
                             if ((rev & Int(POLLIN)) != 0) or ((rev & Int(POLLHUP)) != 0):
-                                conns.handle_readable(routes, responses, keys, idx)
+                                conns.handle_readable[resolve](routes, responses, keys, idx)
             q += 1
+
+
+def _static_noop(
+    route_index: Int,
+    method_code: UInt8,
+    req_head: BytePtr,
+    head_len: Int,
+    body: BytePtr,
+    body_len: Int,
+    mut out_buf: DynamicOut,
+) -> Bool:
+    """Stand-in resolver for static-only serve(); never reached because
+    static tables register no ROUTE_DYNAMIC routes."""
+    _ = route_index
+    _ = method_code
+    _ = req_head
+    _ = head_len
+    _ = body
+    _ = body_len
+    return False
+
+
+def serve(config: WorkerConfig, routes: RouteTable, responses: ResponseSet):
+    """Bind, optionally fork SCM_RIGHTS-fanned-out workers, and serve forever.
+
+    Static-only entry point: every resolved route must be ROUTE_STATIC and
+    backed by a prebuilt ResponseBuffer. Callers must build `routes` and
+    `responses` BEFORE calling serve(): the forks below copy-on-write share
+    those prebuilt buffers across workers, which is what keeps summed RSS low.
+    Dynamic routes need serve_dynamic[] instead.
+    """
+    _serve_impl[_static_noop](config, routes, responses)
+
+
+def serve_dynamic[resolve: ResolverFn](
+    config: WorkerConfig, routes: RouteTable, responses: ResponseSet
+):
+    """serve() with THE one-per-process dynamic-route resolver attached.
+
+    `resolve` is a comptime parameter because Mojo 1.0 cannot store function
+    values in fields or globals; passing it here means exactly one resolver
+    per process tree, installed before any request is served. Route indexes
+    registered via RouteTable.add_dynamic / App.dynamic are handed to the
+    resolver as its first argument — switch on them internally (see the
+    module docstring for the full contract and the recv-buffer aliasing
+    hazard). Static-only apps should keep plain serve().
+    """
+    _serve_impl[resolve](config, routes, responses)
+
+
+def _serve_impl[resolve: ResolverFn](
+    config: WorkerConfig, routes: RouteTable, responses: ResponseSet
+):
+    """Shared boot: signals, fd reservation, bind, fork fan-out, loops."""
+    ignore_sigpipe()
+    reserve_low_descriptors()
+
+    var listener = create_listen_socket(config.port, config.backlog)
+    if Int(listener) < 0:
+        fatal("listen socket failed")
+
+    var keys = standard_header_keys()
+
+    if config.workers > 1:
+        var pairs = malloc_int32s(2 * config.workers)
+        var k = 0
+        while k < config.workers:
+            var sp = malloc_int32s(2)
+            sp[0] = Int32(-1)
+            sp[1] = Int32(-1)
+            socketpair(sp)
+            pairs[k * 2] = sp[0]
+            pairs[k * 2 + 1] = sp[1]
+            k += 1
+        var my_pair = Int32(-1)
+        var k2 = 0
+        while k2 < config.workers:
+            var child_pid = fork_process()
+            if Int(child_pid) == 0:
+                my_pair = pairs[k2 * 2 + 1]
+                break
+            if Int(child_pid) < 0:
+                break
+            k2 += 1
+        if Int(my_pair) < 0:
+            acceptor_forever(listener, pairs, config.workers)
+            return
+        worker_loop[resolve](listener, my_pair, config, routes, responses, keys)
+        return
+    worker_loop[resolve](listener, Int32(-1), config, routes, responses, keys)

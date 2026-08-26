@@ -9,7 +9,7 @@ benchmark server.
 
 ## Status
 
-v0.4.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
+v0.5.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
 the poll(2) core is POSIX so porting is mostly FFI constants.
 
 ## Usage (App layer)
@@ -72,6 +72,58 @@ def handle(body: BytePtr, body_len: Int) -> Int:
         return b.limit * (Int(b.lat) + 1)
     return b.limit * b.page
 ```
+
+## Usage (dynamic routes)
+
+Static routes serve prebuilt buffers with zero per-request allocation. When
+you need code to run per request — cache miss → DB query → fresh response —
+register a **dynamic route** and attach ONE process resolver. Mojo 1.0 cannot
+store function values in fields or globals, so the resolver is a comptime
+parameter on the serving entry point (`run_dynamic[resolve]`): exactly one
+resolver per worker tree, installed before any request is served, switching
+on `route_index` internally.
+
+```mojo
+from mojoflask import App, BytePtr, DynamicOut, METHOD_GET, build_response, free_bytes, make_cstr
+
+comptime IDX_FRESH = 4   # deterministic: registration order
+
+def resolve(route_index: Int, method_code: UInt8, req_head: BytePtr,
+            head_len: Int, body: BytePtr, body_len: Int,
+            mut out_buf: DynamicOut) -> Bool:
+    if route_index == IDX_FRESH:
+        var msg = make_cstr("{\"fresh\":true}")
+        var rb = build_response("200 OK", msg, 15)
+        out_buf = DynamicOut(data=rb.data, length=rb.length, owns=True, static_route=-1)
+        free_bytes(msg)                      # build_response copied it
+        return True                          # engine frees rb after write
+    return False                             # -> fallback response
+
+def main():
+    var app = App(port=8080)
+    app.dynamic(METHOD_GET, "/fresh")        # consumes no ResponseSet slot
+    app.fallback("{\"error\":\"not found\"}")
+    app.run_dynamic[resolve]()               # plain run() would 404 instead
+```
+
+The resolver receives raw spans of the head and body **inside the connection
+receive buffer** — copy anything you keep past your return (aliasing hazard).
+Returning `False`, or `True` with an empty payload, serves the fallback.
+
+**Warm-cache fast-return idiom:** set `out_buf.static_route` (default `-1`)
+to any existing prebuilt route index and the engine serves that buffer with
+zero allocation and zero ownership bookkeeping — hit → cached buffer, miss →
+fresh bytes, in one resolver:
+
+```mojo
+    if cache_hit():
+        out_buf = DynamicOut(data=null_bytes(), length=0, owns=False,
+                             static_route=IDX_CACHED)
+        return True
+```
+
+Owned payloads (`owns=True`) are freed by the engine when the write finishes
+or the connection dies; partial sends resume from the same dynamic bytes.
 
 ## Usage (the Fiber comparison)
 

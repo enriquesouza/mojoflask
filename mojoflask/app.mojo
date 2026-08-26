@@ -40,7 +40,15 @@ from .router import (
     RouteTable,
     route_table,
 )
-from .server import WorkerConfig, serve, worker_config, worker_config_from_env
+from .server import (
+    DynamicOut,
+    ResolverFn,
+    WorkerConfig,
+    serve,
+    serve_dynamic,
+    worker_config,
+    worker_config_from_env,
+)
 
 
 struct App(Movable):
@@ -147,6 +155,18 @@ struct App(Movable):
         """Bind an explicit METHOD_* mask to a pattern and a file-backed body."""
         return self._register_file(mask, path, status, file_path)
 
+    def dynamic(mut self, mask: UInt8, path: String) -> Int:
+        """Register a per-request (dynamic) route; returns its route index.
+
+        No ResponseBuffer is prebuilt or consumed. When a request matches,
+        the engine invokes THE process resolver with the raw request
+        head/body spans; the resolver answers with fresh bytes or a
+        static_route fast-return. Run the app through run_dynamic[resolver]
+        so that resolver is attached; under plain run() matching this route
+        serves the fallback response.
+        """
+        return self.routes.add_dynamic(mask, path)
+
     def _register_file(
         mut self, mask: UInt8, path: String, status: String, file_path: String
     ) -> Int:
@@ -173,8 +193,23 @@ struct App(Movable):
         )
 
     def run(self):
-        """Bind, fork workers and enter the event loop. Never returns."""
+        """Bind, fork workers and enter the event loop. Never returns.
+
+        Static-only entry point; dynamic routes fall back to the 404.
+        """
         serve(self.config, self.routes, self.responses)
+
+    def run_dynamic[resolve: ResolverFn](self):
+        """Bind, fork workers and serve with `resolve` as THE dynamic hook.
+
+        Mojo 1.0 cannot store function values in fields or globals, so the
+        one-per-process resolver is a comptime parameter — installed once for
+        the whole worker tree before any request is served. It receives each
+        dynamic route's index as its first argument and switches on it
+        internally (see mojoflask.server for the full contract). Never
+        returns.
+        """
+        serve_dynamic[resolve](self.config, self.routes, self.responses)
 
 
 def app_from_env(default_port: Int, arena_mb: Int = 4, server_name: String = "mojoflask") -> App:
