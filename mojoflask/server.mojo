@@ -24,11 +24,18 @@ Darwin quirks encoded here (all verified against macOS 26 arm64)
 Connection lifecycle (ConnState.phase)
     PARSE_HEAD     -> accumulate bytes until CRLFCRLF; resolve route, latch
                       the prebuilt response (or mark the route dynamic), note
-                      Content-Length and any explicit Connection: close.
+                      Content-Length and any explicit Connection: close; the
+                      request head's absolute offset is anchored in
+                      req_start for later resolver dispatch.
     READ_BODY      -> drain request body bytes (QUERY/POST) before replying;
                       once drained, dynamic routes invoke the process
                       resolver while static routes aim the writer at the
                       prebuilt response; both fall through to flushing.
+                      normalize_buffer is suspended across this whole phase:
+                      head and body routinely arrive in separate recv events
+                      on fresh connections, and compaction here would orphan
+                      the req_start anchor and overwrite head bytes with the
+                      incoming body.
     WRITE_RESPONSE -> send() slices of the latched response until done; then
                       either keep-alive back to PARSE_HEAD or close the
                       socket.
@@ -207,6 +214,7 @@ struct ConnState(RegisterPassable, ImplicitlyCopyable):
     var write_remaining: Int32
     var dyn_route: Int32
     var req_method: Int32
+    var req_start: Int32
     var head_span: Int32
     var body_span: Int32
     var dyn_data: UntrackedBytePtr
@@ -244,6 +252,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         self.slots[i].dyn_len = Int32(0)
         self.slots[i].dyn_owned = False
         self.slots[i].dyn_route = Int32(-1)
+        self.slots[i].req_start = Int32(0)
 
     def find_free_slot(self) -> Int:
         """First empty slot index, or -1 when the pool is full."""
@@ -274,6 +283,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         self.slots[slot].write_remaining = Int32(0)
         self.slots[slot].dyn_route = Int32(-1)
         self.slots[slot].req_method = Int32(0)
+        self.slots[slot].req_start = Int32(0)
         self.slots[slot].head_span = Int32(0)
         self.slots[slot].body_span = Int32(0)
         self.slots[slot].dyn_data = null_bytes()
@@ -345,6 +355,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                 else:
                     self.slots[i].dyn_route = Int32(-1)
                 self.slots[i].req_method = Int32(head.method_code)
+                self.slots[i].req_start = Int32(off)
                 self.slots[i].head_span = Int32((hend + 4) - off)
                 self.slots[i].body_span = Int32(head.content_length)
                 var chosen: ResponseBuffer
@@ -395,19 +406,23 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
     ):
         """Run the process resolver for slot i's just-consumed request.
 
-        The head span and body span are recovered backwards from buf_off,
-        which stays exact across any normalize_buffer() compaction because
-        compaction shifts the whole request uniformly. On success the write
-        targets are re-aimed at either a prebuilt buffer (static_route
-        fast-return) or fresh resolver bytes (ownership tracked in dyn_owned);
-        on any failure the latched fallback response stands.
+        The head span is addressed FORWARD from req_start, the offset recorded
+        when PARSE_HEAD consumed this request's head; the body span follows it
+        contiguously. Forward addressing is what keeps split-segment arrivals
+        correct: when the head and body land in separate recv events, the
+        in-flight window is never compacted (normalize_buffer skips
+        PHASE_READ_BODY), so req_start stays valid and buf_off — which only
+        counts bytes up to the body's end — would NOT be a valid anchor for
+        backwards recovery. On success the write targets are re-aimed at
+        either a prebuilt buffer (static_route fast-return) or fresh resolver
+        bytes (ownership tracked in dyn_owned); on any failure the latched
+        fallback response stands.
         """
-        var end = Int(self.slots[i].buf_off)
-        var total = Int(self.slots[i].head_span) + Int(self.slots[i].body_span)
-        if total <= 0 or total > end:
-            return
-        var hs = end - total
+        var hs = Int(self.slots[i].req_start)
         var he = hs + Int(self.slots[i].head_span)
+        var be = he + Int(self.slots[i].body_span)
+        if hs < 0 or Int(self.slots[i].head_span) <= 0 or be > Int(self.slots[i].buf_off):
+            return
         var out_buf = DynamicOut(data=null_bytes(), length=0, owns=False, static_route=-1)
         var ok = resolve(
             Int(self.slots[i].dyn_route),
@@ -433,7 +448,19 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
             self.slots[i].resp_len = Int32(out_buf.length)
 
     def normalize_buffer(self, i: Int):
-        """Compact the receive buffer so offsets never march past buf_cap."""
+        """Compact the receive buffer so offsets never march past buf_cap.
+
+        Skipped while a request is mid-flight (PHASE_READ_BODY: head consumed,
+        body draining, resolver not yet run): the bytes from req_start through
+        buf_off are the request the dispatcher will address by absolute offset,
+        and resetting buf_off to zero on an empty tail would both orphan that
+        anchor and let the next recv overwrite the head with body bytes —
+        exactly the fresh-connection split-segment failure this slot field
+        exists to prevent. buf_off stays bounded because recv_bytes never
+        writes past buf_cap and every drained byte advances it.
+        """
+        if Int(self.slots[i].phase) == PHASE_READ_BODY:
+            return
         var dl = Int(self.slots[i].data_len)
         if dl == 0:
             self.slots[i].buf_off = Int32(0)
@@ -533,6 +560,7 @@ def conn_table(config: WorkerConfig) -> ConnTable:
         write_remaining=Int32(0),
         dyn_route=Int32(-1),
         req_method=Int32(0),
+        req_start=Int32(0),
         head_span=Int32(0),
         body_span=Int32(0),
         dyn_data=null_bytes(),
