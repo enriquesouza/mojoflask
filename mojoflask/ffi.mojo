@@ -40,6 +40,7 @@ comptime EAGAIN_CODE = 35
 comptime EINTR_CODE = 4
 comptime SIGPIPE_SIGNAL = 13
 comptime SIG_IGN_HANDLER = 1
+comptime WNOHANG_FLAG = 1
 
 
 comptime BytePtr = Pointer[T=Byte, mut=True, origin=MutAnyOrigin]
@@ -97,6 +98,20 @@ def fatal(message: String):
     """Print a startup error and abort the process."""
     print(message)
     external_call["exit", c_int](c_int(1))
+
+
+def exit_now(code: Int):
+    """_exit(): terminate immediately, skipping atexit handlers and stdio
+    flush — the only safe way out of a child whose allocator state is
+    already suspect."""
+    external_call["_exit", c_int](c_int(code))
+
+
+def waitpid_nohang(pid: Int32, status_out: Int32Ptr) -> Int32:
+    """waitpid(pid, &status, WNOHANG): 0 while the child still runs, the pid
+    once it has exited (raw wait status written into status_out[0]), -1 on
+    error (ECHILD etc. — treat as dead)."""
+    return external_call["waitpid", c_int](pid, status_out, c_int(WNOHANG_FLAG))
 
 
 def malloc_bytes(n: Int) -> BytePtr:
@@ -328,6 +343,14 @@ def wait_on_poll(fds: UntrackedPollFdPtr, n: Int) -> Int:
     return Int(r)
 
 
+def wait_on_poll_timeout(fds: UntrackedPollFdPtr, n: Int, timeout_ms: Int) -> Int:
+    """poll() over n entries with a millisecond timeout so supervision loops
+    can wake periodically; returns -1 with errno EINTR when a signal (e.g.
+    SIGCHLD) lands mid-wait."""
+    var r = external_call["poll", c_int](fds, c_int(n), c_int(timeout_ms))
+    return Int(r)
+
+
 def send_bytes(fd: Int32, p: BytePtr, n: Int) -> Int:
     """send() n bytes from p; returns bytes sent or -1."""
     var r = external_call["send", c_ssize_t](fd, p, c_size_t(n), c_int(0))
@@ -343,6 +366,11 @@ def recv_bytes(fd: Int32, p: BytePtr, n: Int) -> Int:
 def malloc_int32s(n: Int) -> Int32Ptr:
     """Raw int32 array allocation."""
     return external_call["malloc", Int32Ptr](c_size_t(4 * n))
+
+
+def malloc_ints(n: Int) -> IntPtr:
+    """Raw pointer-width int array allocation (stores addresses)."""
+    return external_call["malloc", IntPtr](c_size_t(8 * n))
 
 
 def malloc_pollfds(n: Int) -> UntrackedPollFdPtr:

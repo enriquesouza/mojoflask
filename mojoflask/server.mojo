@@ -40,44 +40,74 @@ Connection lifecycle (ConnState.phase)
                       either keep-alive back to PARSE_HEAD or close the
                       socket.
 
-Dynamic routes and the single process resolver
-    Mojo 1.0 forbids module-level mutable globals ("global variables are not
-    supported") AND storing function values inside struct fields ("struct
-    fields do not support trait types"), so a runtime set_resolver(f) cell is
-    impossible in-language. The single-per-process hook therefore travels as
-    a COMPTIME parameter: register dynamic routes, then enter the loop with
-    serve_dynamic[resolve](config, routes, responses) (App: run_dynamic[...])
-    — exactly one resolver per process tree, inherited by every forked
-    worker, installed before any request is served. Static-only apps keep
-    plain run()/serve(), whose hot path never touches the resolver.
+    Dynamic routes and the single process resolver
+        Mojo 1.0 forbids module-level mutable globals ("global variables are not
+        supported") AND storing function values inside struct fields ("struct
+        fields do not support trait types"), so a runtime set_resolver(f) cell is
+        impossible in-language. The single-per-process hook therefore travels as
+        a COMPTIME parameter: register dynamic routes, then enter the loop with
+        serve_dynamic[resolve](config, routes, responses) (App: run_dynamic[...])
+        — exactly one resolver per process tree, inherited by every forked
+        worker, installed before any request is served. Static-only apps keep
+        plain run()/serve(), whose hot path never touches the resolver.
 
-    When a resolved route's kind is ROUTE_DYNAMIC, the engine waits until the
-    head AND body are fully read, then calls the resolver once with:
+        When a resolved route's kind is ROUTE_DYNAMIC, the engine waits until the
+        head AND body are fully read, then calls the resolver once with:
 
-      - route_index  which add_dynamic() registration matched
-      - method_code  the request's METHOD_* bit (0 when unrecognized)
-      - req_head/head_len   span of the full request head inside the
-                            connection's receive buffer
-      - body/body_len       span of the drained request body (may be empty)
+          - route_index  which add_dynamic() registration matched
+          - method_code  the request's METHOD_* bit (0 when unrecognized)
+          - req_head/head_len   span of the full request head inside the
+                                connection's receive buffer
+          - body/body_len       span of the drained request body (may be empty)
 
-    ALIASING HAZARD: both spans point INTO the connection recv buffer, which
-    is reused for the next request as soon as the response write completes —
-    the handler MUST copy anything it retains past its return.
+        ALIASING HAZARD: both spans point INTO the connection recv buffer, which
+        is reused for the next request as soon as the response write completes —
+        the handler MUST copy anything it retains past its return.
 
-    The resolver answers through one DynamicOut mutable argument:
+        The resolver answers through one DynamicOut mutable argument:
 
-      - static_route >= 0  serve responses.at(static_route) instead — the
-        fast-return idiom lets a handler answer warm-cache hits from an
-        existing prebuilt buffer with zero allocation; data/length are then
-        ignored.
-      - otherwise data/length describe fresh response bytes (a complete
-        HTTP/1.x message including headers). owns=True makes the engine
-        free() data after the write finishes or the connection dies;
-        owns=False means the handler keeps ownership. Returning True with an
-        empty payload, or returning False, serves the fallback response.
+          - static_route >= 0  serve responses.at(static_route) instead — the
+            fast-return idiom lets a handler answer warm-cache hits from an
+            existing prebuilt buffer with zero allocation; data/length are then
+            ignored.
+          - otherwise data/length describe fresh response bytes (a complete
+            HTTP/1.x message including headers). owns=True makes the engine
+            free() data after the write finishes or the connection dies;
+            owns=False means the handler keeps ownership. Returning True with an
+            empty payload, or returning False, serves the fallback response.
 
-    Serving a dynamic route under plain serve() (no resolver) serves the
-    fallback response — never a crash.
+        Serving a dynamic route under plain serve() (no resolver) serves the
+        fallback response — never a crash.
+
+Fork poisoning, the worker canary, and supervised respawn
+        The parent process runs ~13 Mojo/AsyncRT background threads by the time
+        it forks workers. fork() on Darwin clones ONLY the calling thread, so
+        whatever tcmalloc thread-cache state those threads held mid-mutation is
+        snapshot into the child inconsistent: a fraction of children (observed
+        p ~= 0.25-0.5 per fork under load) are born with a corrupted allocator
+        and die later with SIGABRT/SIGSEGV inside tcmalloc's freelist walking
+        (SLL_Next). pthread_atfork cannot help (handlers would have to run on
+        the foreign threads), so mojoflask cures it operationally:
+
+        - Every child, IMMEDIATELY post-fork and before touching the connection
+          table or any payload, runs allocator_canary(): 2000 iterations of
+          simultaneous mallocs across the 64B / 4KB / 256KB size classes
+          (pattern write + verify + free) plus a 64-slot set/get/overwrite
+          table loop mirroring the SlotTable churn of cache-bearing apps. A
+          child whose heap hands out overlapping or mangled chunks FAILS the
+          pattern check and _exit(70)s; a child whose freelist metadata is
+          broken aborts inside the canary's own malloc/free — either way the
+          defect surfaces in milliseconds instead of mid-request.
+        - The parent never blocks forever in accept(): it polls the listener
+          with a 100ms timeout, reaps every worker with waitpid(WNOHANG)
+          (SIGCHLD also EINTRs the poll for near-instant detection), skips
+          round-robin dispatch to dead slots, and re-forks a FRESH child from
+          the still-healthy parent — respawn converges geometrically at the
+          poisoning rate (0.5^k), capped at RESPAWN_CAP attempts per worker
+          before the parent declares the tree fatal.
+        - Connection fds accepted during a dead-slot gap queue on the SAME
+          socketpair endpoint (the parent keeps every pair's far end open), so
+          the respawned child inherits and drains them; no accept is lost.
 """
 
 from std.os import getenv
@@ -94,6 +124,7 @@ from mojoflask.ffi import (
     PollFd,
     BytePtr,
     Int32Ptr,
+    IntPtr,
     UntrackedBytePtr,
     UntrackedInt32Ptr,
     UntrackedPollFdPtr,
@@ -103,11 +134,13 @@ from mojoflask.ffi import (
     current_pid,
     dup_fd,
     errno_now,
+    exit_now,
     fatal,
     fork_process,
     ignore_sigpipe,
     malloc_bytes,
     malloc_int32s,
+    malloc_ints,
     malloc_pollfds,
     min_int,
     null_bytes,
@@ -120,6 +153,8 @@ from mojoflask.ffi import (
     socketpair,
     untrack,
     wait_on_poll,
+    wait_on_poll_timeout,
+    waitpid_nohang,
 )
 
 from mojoflask.http import (
@@ -144,6 +179,14 @@ comptime DEFAULT_MAX_CONNS = 4096
 comptime MAX_HEAD_BYTES = 30000
 comptime COMPACT_THRESHOLD = 16384
 comptime RESERVED_FD_GUARDS = 96
+
+comptime CANARY_ITERATIONS = 2000
+comptime CANARY_EXIT_CODE = 70
+comptime CANARY_SLOT_COUNT = 64
+comptime CANARY_KEY_CAP = 64
+comptime RESPAWN_CAP = 50
+comptime SUPERVISE_POLL_MS = 100
+comptime REAP_EVERY_ACCEPTS = 256
 
 # Padded per-slot stride for the heap allocation backing ConnTable; generous
 # on purpose so field additions never under-allocate.
@@ -595,21 +638,235 @@ def reserve_low_descriptors():
         g += 1
 
 
-def acceptor_forever(listener: Int32, pairs: Int32Ptr, worker_count: Int):
-    """Parent-side acceptor: hand every new fd to workers round-robin."""
+def canary_fill(p: BytePtr, n: Int, seed: Int):
+    """Stamp n bytes with the positional pattern (seed + offset) & 255."""
+    var i = 0
+    while i < n:
+        p[i] = UInt8((seed + i) & 255)
+        i += 1
+
+
+def canary_verify(p: BytePtr, n: Int, seed: Int) -> Bool:
+    """True when every byte still carries the canary_fill pattern."""
+    var i = 0
+    while i < n:
+        if Int(p[i]) != ((seed + i) & 255):
+            return False
+        i += 1
+    return True
+
+
+def slot_canary(slots: Int, iterations: Int) -> Bool:
+    """Malloc-heap churn shaped like a cache SlotTable: parallel arrays of
+    inline keys, lengths and owned value buffers, driven through
+    set / get / overwrite cycles where every overwrite first verifies and
+    frees the displaced buffer. A full sweep re-verifies all slots each time
+    the round wraps, catching corruption planted by a NEIGHBORING free."""
+    var keys = malloc_bytes(slots * CANARY_KEY_CAP)
+    var key_lens = malloc_int32s(slots)
+    var value_ptrs = malloc_ints(slots)
+    var value_lens = malloc_int32s(slots)
+    var seeds = malloc_int32s(slots)
+    var j = 0
+    while j < slots:
+        key_lens[j] = Int32(0)
+        value_ptrs[j] = 0
+        value_lens[j] = Int32(0)
+        seeds[j] = Int32(0)
+        j += 1
+    var it = 0
+    while it < iterations:
+        var idx = it % slots
+        if Int(key_lens[idx]) > 0:
+            var old = BytePtr(unsafe_from_address=value_ptrs[idx])
+            if not canary_verify(old, Int(value_lens[idx]), Int(seeds[idx]) + 5):
+                free_bytes(old)
+                return False
+            free_bytes(old)
+        var klen = 16 + (it & 15)
+        canary_fill(keys + idx * CANARY_KEY_CAP, klen, it)
+        var vlen = 48 + (it & 63)
+        var v = malloc_bytes(vlen)
+        canary_fill(v, vlen, it + 5)
+        value_ptrs[idx] = Int(v)
+        value_lens[idx] = Int32(vlen)
+        key_lens[idx] = Int32(klen)
+        seeds[idx] = Int32(it)
+        if not canary_verify(v, vlen, it + 5):
+            return False
+        if not canary_verify(keys + idx * CANARY_KEY_CAP, klen, it):
+            return False
+        if (it % slots) == slots - 1:
+            var s = 0
+            while s < slots:
+                if Int(key_lens[s]) > 0:
+                    var vp = BytePtr(unsafe_from_address=value_ptrs[s])
+                    if not canary_verify(
+                        vp, Int(value_lens[s]), Int(seeds[s]) + 5
+                    ):
+                        return False
+                    if not canary_verify(
+                        keys + s * CANARY_KEY_CAP, Int(key_lens[s]), Int(seeds[s])
+                    ):
+                        return False
+                s += 1
+        it += 1
+    var f = 0
+    while f < slots:
+        if Int(key_lens[f]) > 0:
+            free_bytes(BytePtr(unsafe_from_address=value_ptrs[f]))
+        f += 1
+    free_bytes(keys)
+    free_bytes(BytePtr(unsafe_from_address=Int(key_lens)))
+    free_bytes(BytePtr(unsafe_from_address=Int(value_ptrs)))
+    free_bytes(BytePtr(unsafe_from_address=Int(value_lens)))
+    free_bytes(BytePtr(unsafe_from_address=Int(seeds)))
+    return True
+
+
+def allocator_canary(iterations: Int) -> Bool:
+    """Post-fork heap self-test; the whole fork-poisoning story lives in the
+    module docstring.
+
+    Each iteration holds one 64B, one 4KB and one 256KB allocation
+    simultaneously, stamps each with a distinct positional pattern, verifies
+    all three, then frees them — overlapping or mangled chunks (tcmalloc
+    handing the same span to two size classes after a dirty fork) fail the
+    verify; broken freelist metadata aborts inside malloc/free itself. The
+    slot-table churn pass then exercises the small-class alloc/verify/free
+    cycle the way a cache-bearing worker hammers it. Runs BEFORE the
+    connection table or any payload is touched, so a poisoned child dies at
+    birth with exit code CANARY_EXIT_CODE (or a signal) instead of corrupting
+    live responses."""
+    var it = 0
+    while it < iterations:
+        var p_small = malloc_bytes(64)
+        canary_fill(p_small, 64, it & 255)
+        var p_page = malloc_bytes(4096)
+        canary_fill(p_page, 4096, (it + 61) & 255)
+        var p_big = malloc_bytes(262144)
+        canary_fill(p_big, 262144, (it + 137) & 255)
+        var ok = canary_verify(p_small, 64, it & 255)
+        if ok:
+            ok = canary_verify(p_page, 4096, (it + 61) & 255)
+        if ok:
+            ok = canary_verify(p_big, 262144, (it + 137) & 255)
+        free_bytes(p_small)
+        free_bytes(p_page)
+        free_bytes(p_big)
+        if not ok:
+            return False
+        it += 1
+    return slot_canary(CANARY_SLOT_COUNT, iterations)
+
+
+def spawn_worker[resolve: ResolverFn](
+    listener: Int32,
+    pairs: Int32Ptr,
+    slot: Int,
+    config: WorkerConfig,
+    routes: RouteTable,
+    responses: ResponseSet,
+    keys: RequestHeaderKeys,
+) -> Int32:
+    """Fork worker `slot`; the child never returns.
+
+    Child path: allocator canary first (before the connection table or any
+    payload is touched) — a mismatched pattern exits with CANARY_EXIT_CODE
+    and a hard allocator abort dies by signal; both land in the parent's
+    waitpid as a death to respawn. Survivors enter worker_loop on this
+    slot's socketpair end. Parent path: returns the child pid (-1 on fork
+    failure) and keeps going."""
+    var child_pid = fork_process()
+    if Int(child_pid) == 0:
+        if not allocator_canary(CANARY_ITERATIONS):
+            exit_now(CANARY_EXIT_CODE)
+        worker_loop[resolve](
+            listener, pairs[slot * 2 + 1], config, routes, responses, keys
+        )
+        exit_now(0)
+    return child_pid
+
+
+def supervised_acceptor[resolve: ResolverFn](
+    listener: Int32,
+    pairs: Int32Ptr,
+    pids: Int32Ptr,
+    alive: Int32Ptr,
+    attempts: Int32Ptr,
+    worker_count: Int,
+    config: WorkerConfig,
+    routes: RouteTable,
+    responses: ResponseSet,
+    keys: RequestHeaderKeys,
+):
+    """Parent-side acceptor AND supervisor: hand accepted fds round-robin to
+    live workers, re-fork dead ones from this still-healthy parent.
+
+    Polling the listener with a 100ms timeout replaces the old block-forever
+    wait so the loop also wakes to reap: waitpid(WNOHANG) sweeps every worker
+    each timeout (plus every REAP_EVERY_ACCEPTS accepts under load, plus the
+    EINTR a SIGCHLD delivers mid-poll). A dead slot is skipped by dispatch
+    until its respawn completes — queued fds ride the surviving socketpair
+    endpoint and are drained by the fresh child — and respawn retries are
+    capped at RESPAWN_CAP per worker slot before the parent gives up
+    fatally. Any death counts (canary exit 70, allocator signal, worker
+    crash); the poisoning rate per fork makes N consecutive bad spawns
+    vanishingly unlikely, so the cap only trips on true systemic failure."""
     var next_worker = 0
+    var since_reap = 0
     var single = malloc_pollfds(1)
+    var status_out = malloc_int32s(1)
     while True:
         single[0] = PollFd(fd=listener, events=POLLIN, revents=UInt16(0))
-        var ready = wait_on_poll(single, 1)
-        if ready <= 0:
-            continue
-        var cfd = accept_connection(listener)
-        if Int(cfd) < 0:
-            continue
-        _ = send_fd(pairs[(next_worker % worker_count) * 2], cfd)
-        close_fd(cfd)
-        next_worker += 1
+        var ready = wait_on_poll_timeout(single, 1, SUPERVISE_POLL_MS)
+        if ready > 0:
+            var cfd = accept_connection(listener)
+            if Int(cfd) >= 0:
+                var target = next_worker % worker_count
+                var probes = 0
+                while (Int(alive[target]) == 0) and (probes < worker_count):
+                    target = (target + 1) % worker_count
+                    probes += 1
+                if Int(alive[target]) == 1:
+                    _ = send_fd(pairs[target * 2], cfd)
+                close_fd(cfd)
+                next_worker = target + 1
+            since_reap += 1
+        var reap_now = ready <= 0 or since_reap >= REAP_EVERY_ACCEPTS
+        if reap_now:
+            since_reap = 0
+            var k = 0
+            while k < worker_count:
+                var dead = False
+                if Int(alive[k]) == 1:
+                    var r = waitpid_nohang(pids[k], status_out)
+                    if r != 0:
+                        alive[k] = Int32(0)
+                        dead = True
+                else:
+                    dead = True
+                if dead:
+                    attempts[k] += 1
+                    if Int(attempts[k]) > RESPAWN_CAP:
+                        fatal("worker respawn cap exceeded")
+                    if Int(alive[k]) == 0 and Int(pids[k]) > 0:
+                        print(
+                            "mojoflask worker slot=",
+                            k,
+                            " pid=",
+                            pids[k],
+                            " died (wait status ",
+                            status_out[0],
+                            "); respawn attempt ",
+                            attempts[k],
+                        )
+                    pids[k] = spawn_worker[resolve](
+                        listener, pairs, k, config, routes, responses, keys
+                    )
+                    if Int(pids[k]) > 0:
+                        alive[k] = Int32(1)
+                k += 1
 
 
 def worker_loop[resolve: ResolverFn](
@@ -746,19 +1003,28 @@ def _serve_impl[resolve: ResolverFn](
             pairs[k * 2] = sp[0]
             pairs[k * 2 + 1] = sp[1]
             k += 1
-        var my_pair = Int32(-1)
+        var pids = malloc_int32s(config.workers)
+        var alive = malloc_int32s(config.workers)
+        var attempts = malloc_int32s(config.workers)
         var k2 = 0
         while k2 < config.workers:
-            var child_pid = fork_process()
-            if Int(child_pid) == 0:
-                my_pair = pairs[k2 * 2 + 1]
-                break
-            if Int(child_pid) < 0:
-                break
+            pids[k2] = spawn_worker[resolve](
+                listener, pairs, k2, config, routes, responses, keys
+            )
+            alive[k2] = Int32(Int(pids[k2]) > 0)
+            attempts[k2] = Int32(0)
             k2 += 1
-        if Int(my_pair) < 0:
-            acceptor_forever(listener, pairs, config.workers)
-            return
-        worker_loop[resolve](listener, my_pair, config, routes, responses, keys)
+        supervised_acceptor[resolve](
+            listener,
+            pairs,
+            pids,
+            alive,
+            attempts,
+            config.workers,
+            config,
+            routes,
+            responses,
+            keys,
+        )
         return
     worker_loop[resolve](listener, Int32(-1), config, routes, responses, keys)
