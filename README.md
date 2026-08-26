@@ -9,7 +9,7 @@ benchmark server.
 
 ## Status
 
-v0.3.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
+v0.4.0 — working, benchmarked, macOS arm64 first. Linux (epoll) is untested;
 the poll(2) core is POSIX so porting is mostly FFI constants.
 
 ## Usage (App layer)
@@ -45,6 +45,13 @@ raw-table users while `routes.add(pattern)` keeps accepting any method.
 
 Method codes are computed from the bytes of the existing request-line scan —
 routing stays allocation-free and adds no extra parsing pass.
+
+`SlotTable(capacity, ttl_ns)` is the search-cache substrate for mirroring a
+Go `ResponseCache` hit path: build keys with `KeyBuilder`
+(`append_str/append_int/append_grid3`, FNV-1a via `fnv_init`/`key_hash`),
+then `get(hash, key, klen)` serves the prebuilt `ResponseBuffer` or a
+zero-length miss; only `set()` copies (the key), everything else is
+allocation-free.
 
 ## Usage (request bodies)
 
@@ -150,6 +157,7 @@ that), TLS, HTTP/2 — put nginx/Caddy in front if you need those today.
 ```
 mojoflask/__init__.mojo   public API surface
 mojoflask/bodyjson.mojo   request-body JSON (EmberJson)
+mojoflask/cache.mojo      FNV-1a keys + SlotTable search cache
 mojoflask/ffi.mojo        libc layer (the only ugly file, quarantined)
 mojoflask/http.mojo       parsing + assembly
 mojoflask/router.mojo     RouteTable

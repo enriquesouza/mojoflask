@@ -8,6 +8,9 @@ Public API
     response_set()               route-indexed table of prebuilt responses
     ParsedBody / parse_json_body()
                                   EmberJson-backed flat request-body decoding
+    SlotTable / KeyBuilder / fnv_init() / fnv_byte() / round3_half_away()
+                                  search-cache substrate: FNV-1a keys, grid
+                                  rounding, prebuilt-response slot lookup
     WorkerConfig / worker_config_from_env()
     serve(config, routes, responses)
                                  bind + fork + poll event loop, never returns
@@ -19,6 +22,16 @@ start with mojoflask.server for the SO_REUSEPORT/SCM_RIGHTS story.
 from .app import App, app_from_env
 
 from .bodyjson import ParsedBody, parse_json_body
+
+from .cache import (
+    DEFAULT_CAPACITY,
+    KeyBuilder,
+    SlotTable,
+    fnv_byte,
+    fnv_init,
+    key_hash,
+    round3_half_away,
+)
 
 from .ffi import (
     BytePtr,
