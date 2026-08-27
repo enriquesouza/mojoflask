@@ -44,6 +44,7 @@ from .ffi import (
 )
 
 from .http import (
+    MAX_RESPONSES,
     ParsedHead,
     RequestHeaderKeys,
     ResponseBuffer,

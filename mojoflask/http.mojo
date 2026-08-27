@@ -17,6 +17,7 @@ Darwin quirks encoded here
 from mojoflask.ffi import (
     BytePtr,
     UntrackedBytePtr,
+    fatal,
     free_bytes,
     malloc_bytes,
     null_bytes,
@@ -52,7 +53,9 @@ comptime HEADER_CONNECTION_KEY = "connection:"
 comptime TOKEN_CLOSE = "close"
 
 
-comptime MAX_ROUTES = 64
+comptime MAX_ROUTES = 128
+comptime MAX_RESPONSES = MAX_ROUTES * 2
+comptime RESPONSE_BUFFER_BYTES = 16
 comptime UntrackedResponseBufferPtr = Pointer[
     T=ResponseBuffer, mut=True, origin=UntrackedOrigin[mut=True]
 ]
@@ -69,14 +72,38 @@ struct ResponseBuffer(RegisterPassable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct ResponseSet(RegisterPassable, ImplicitlyCopyable):
-    """Route-indexed table of prebuilt responses plus a fallback for misses."""
+    """Route-indexed table of prebuilt responses plus a fallback for misses.
+
+    Capacity is MAX_RESPONSES = MAX_ROUTES * 2 (256 with the default 128
+    routes; MAX_ROUTES is duplicated in mojoflask.router and the two must
+    stay in sync). In the lockstep App flow every route — static or
+    dynamic — consumes exactly one ResponseSet slot, so responses never
+    outnumber routes there; the 2x headroom covers raw-table users whose
+    dynamic-resolver returns static_route indexes of extra prebuilt
+    responses registered beyond the lockstep prefix. add() refuses to
+    write past the table and aborts at startup instead of corrupting the
+    heap.
+    """
 
     var count: Int
     var buffers: UntrackedResponseBufferPtr
     var fallback: ResponseBuffer
 
     def add(mut self, response: ResponseBuffer) -> Int:
-        """Register a response; returns its route index."""
+        """Register a response; returns its route index.
+
+        Startup-only. Aborts the process when the table is already at
+        MAX_RESPONSES entries — an unchecked append here used to write
+        past the allocation and silently corrupt adjacent heap (route 0/1
+        buffers), because ResponseBuffer is 16 bytes but the table was
+        sized as if it were 8.
+        """
+        if self.count >= MAX_RESPONSES:
+            fatal(
+                "response set full: "
+                + String(MAX_RESPONSES)
+                + " entries (MAX_RESPONSES = MAX_ROUTES * 2)"
+            )
         self.buffers[self.count] = response
         self.count += 1
         return self.count - 1
@@ -93,10 +120,21 @@ struct ResponseSet(RegisterPassable, ImplicitlyCopyable):
 
 
 def response_set() -> ResponseSet:
-    """Create an empty response table (startup-only, heap-backed)."""
+    """Create an empty response table (startup-only, heap-backed).
+
+    Allocates RESPONSE_BUFFER_BYTES * MAX_RESPONSES bytes so the byte size
+    and the slot count agree: ResponseBuffer is one pointer plus one Int
+    (16 bytes on every supported 64-bit target). The original bug sized
+    this as 8 bytes per entry, so the 512-byte block only held 32 slots
+    while unchecked adds kept writing.
+    """
     return ResponseSet(
         count=0,
-        buffers=UntrackedResponseBufferPtr(unsafe_from_address=Int(malloc_bytes(8 * MAX_ROUTES))),
+        buffers=UntrackedResponseBufferPtr(
+            unsafe_from_address=Int(
+                malloc_bytes(RESPONSE_BUFFER_BYTES * MAX_RESPONSES)
+            )
+        ),
         fallback=ResponseBuffer(data=null_bytes(), length=0),
     )
 

@@ -47,7 +47,7 @@ from mojoflask.ffi import (
 
 
 comptime MAX_ROUTE_SEGS = 8
-comptime MAX_ROUTES = 64
+comptime MAX_ROUTES = 128
 
 comptime SEG_LITERAL = UInt8(0)
 comptime SEG_WILDCARD = UInt8(1)
@@ -146,7 +146,7 @@ struct RouteTable(RegisterPassable, ImplicitlyCopyable):
         """Shared pattern compiler for add_method/add_dynamic."""
         var route = self.count
         if route >= MAX_ROUTES:
-            fatal("route limit exceeded")
+            fatal("route table full: " + String(MAX_ROUTES) + " routes (MAX_ROUTES)")
         var pat = make_cstr(pattern)
         var total = pattern.byte_length()
         var seg = 0
