@@ -52,6 +52,21 @@ v0.6.0 — mojoflask itself no longer ships it.
 
 ## Usage (request bodies)
 
+Bodies are drained in full up to the declared Content-Length before any
+response is written or a resolver runs — close(2) with unread receive data
+emits a TCP reset that destroys the in-flight response, which is exactly what
+pre-0.7.1 did to any request whose head+body exceeded the 32KB receive buffer
+(RST at ~32-64KB and up; long-standing, present since v0.6.3). Engine bounds:
+a Content-Length above `MAX_BODY_BYTES` (10MB) is rejected at head parse with
+a connection close mirroring the `MAX_HEAD_BYTES` (30KB) header rejection, and
+each body read must make progress within 3 seconds (`DRAIN_IDLE_MS`) or the
+connection is evicted — with v0.7.0's read-idle timer gone, that deadline is
+the de-facto read timeout for the whole request. The receive buffer grows
+once (bounded, re-anchoring the in-flight request) so a 10MB body can drain
+through a 32KB buffer; grown buffers are released when the connection closes.
+Pipelined bursts (hundreds of requests in one send) still drain in a single
+pass without growth.
+
 `parse_json_body` decodes a flat JSON body into a `ParsedBody` register struct
 using [EmberJson](https://github.com/bgreni/EmberJson). Unknown keys are
 ignored, missing keys keep their defaults (`limit=12`, `page=1`, lat/lng `0`,

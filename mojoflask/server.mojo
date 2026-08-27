@@ -35,7 +35,14 @@ Connection lifecycle (ConnState.phase)
                       head and body routinely arrive in separate recv events
                       on fresh connections, and compaction here would orphan
                       the req_start anchor and overwrite head bytes with the
-                      incoming body.
+                      incoming body. When the buffer runs out of recv room
+                      mid-body, grow_buffer() re-anchors and enlarges it
+                      (bounded by MAX_BUF_BYTES); Content-Length beyond
+                      MAX_BODY_BYTES is rejected at head parse. Each drain
+                      read must make progress within DRAIN_IDLE_MS or the
+                      connection is closed — since v0.7.0 removed the read-
+                      idle timer, this deadline is the de-facto read timeout
+                      for the whole request.
     WRITE_RESPONSE -> send() slices of the latched response until done; then
                       either keep-alive back to PARSE_HEAD or close the
                       socket.
@@ -138,12 +145,14 @@ from mojoflask.ffi import (
     fatal,
     fd_pass_scratch,
     fork_process,
+    free_bytes,
     ignore_sigpipe,
     malloc_bytes,
     malloc_int32s,
     malloc_ints,
     malloc_pollfds,
     min_int,
+    monotonic_ms,
     null_bytes,
     open_socket,
     parent_pid,
@@ -180,6 +189,9 @@ comptime DEFAULT_BUF_CAP = 32768
 comptime DEFAULT_MAX_CONNS = 4096
 
 comptime MAX_HEAD_BYTES = 30000
+comptime MAX_BODY_BYTES = 10485760
+comptime MAX_BUF_BYTES = 10485760 + 131072
+comptime DRAIN_IDLE_MS = 3000
 comptime COMPACT_THRESHOLD = 16384
 comptime RESERVED_FD_GUARDS = 96
 
@@ -255,6 +267,7 @@ struct ConnState(RegisterPassable, ImplicitlyCopyable):
     var fd: Int32
     var recv_buf: UntrackedBytePtr
     var has_recv_buf: Bool
+    var buf_size: Int32
     var buf_off: Int32
     var data_len: Int32
     var phase: Int32
@@ -272,6 +285,7 @@ struct ConnState(RegisterPassable, ImplicitlyCopyable):
     var dyn_data: UntrackedBytePtr
     var dyn_len: Int32
     var dyn_owned: Bool
+    var drain_deadline_ms: Int64
 
 
 @fieldwise_init
@@ -292,8 +306,17 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
     var poll_map: UntrackedInt32Ptr
 
     def close_conn(mut self, i: Int):
-        """Tear down slot i; release any dynamic payload, keep recv buffer."""
+        """Tear down slot i; release any dynamic payload, keep recv buffer.
+
+        The default-size buffer is kept across connections so accept churn
+        never mallocs; a GROWN buffer (body drain oversized it) is freed here
+        so dead slots cannot pin their peak size forever."""
         self.release_dynamic(i)
+        if self.slots[i].has_recv_buf and Int(self.slots[i].buf_size) > Int(self.buf_cap):
+            free_bytes(retracked(self.slots[i].recv_buf))
+            self.slots[i].recv_buf = null_bytes()
+            self.slots[i].has_recv_buf = False
+            self.slots[i].buf_size = Int32(0)
         var fd = self.slots[i].fd
         if Int(fd) >= 0:
             close_fd(fd)
@@ -333,6 +356,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         if not self.slots[slot].has_recv_buf:
             self.slots[slot].recv_buf = untrack(malloc_bytes(self.buf_cap))
             self.slots[slot].has_recv_buf = True
+            self.slots[slot].buf_size = Int32(Int(self.buf_cap))
         self.slots[slot].fd = cfd
         self.slots[slot].buf_off = Int32(0)
         self.slots[slot].data_len = Int32(0)
@@ -350,6 +374,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         self.slots[slot].dyn_data = null_bytes()
         self.slots[slot].dyn_len = Int32(0)
         self.slots[slot].dyn_owned = False
+        self.slots[slot].drain_deadline_ms = Int64(0)
         self.live = self.live + Int32(1)
 
     def flush_write(mut self, i: Int):
@@ -409,6 +434,9 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                         return
                     break
                 var head = parse_request_head(buf, off, hend, keys)
+                if head.content_length > MAX_BODY_BYTES:
+                    self.close_conn(i)
+                    return
                 var route_idx = routes.resolve_method(
                     buf, head.path_start, head.path_end, head.method_code
                 )
@@ -434,6 +462,10 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                 self.slots[i].buf_off = Int32(off + adv)
                 self.slots[i].data_len = Int32(dl - adv)
                 self.slots[i].phase = Int32(PHASE_READ_BODY)
+                if Int(self.slots[i].body_remaining) > 0:
+                    self.slots[i].drain_deadline_ms = Int64(
+                        monotonic_ms() + DRAIN_IDLE_MS
+                    )
                 moved = True
             elif Int(self.slots[i].phase) == PHASE_READ_BODY:
                 var take = min_int(Int(self.slots[i].data_len), Int(self.slots[i].body_remaining))
@@ -441,6 +473,9 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                     self.slots[i].buf_off = self.slots[i].buf_off + Int32(take)
                     self.slots[i].data_len = self.slots[i].data_len - Int32(take)
                     self.slots[i].body_remaining = self.slots[i].body_remaining - Int32(take)
+                    self.slots[i].drain_deadline_ms = Int64(
+                        monotonic_ms() + DRAIN_IDLE_MS
+                    )
                     moved = True
                 if Int(self.slots[i].body_remaining) > 0:
                     break
@@ -535,6 +570,33 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
                 k += 1
             self.slots[i].buf_off = Int32(0)
 
+    def grow_buffer(mut self, i: Int, used: Int) -> Bool:
+        """Grow slot i's receive buffer so an in-flight body can finish draining.
+
+        The dispatcher addresses [req_start, buf_off) by absolute offset and
+        normalize_buffer stays suspended across the whole body phase, so growth
+        copies the preserved window [req_start, used) down to offset 0 and
+        re-anchors req_start at 0 — the anchor moves WITH its bytes instead of
+        being orphaned. One malloc + one copy per oversized request; the new
+        size covers the rest of the declared Content-Length plus the pipelined
+        tail already buffered, capped at MAX_BUF_BYTES."""
+        var preserve = used - Int(self.slots[i].req_start)
+        var needed = preserve + Int(self.slots[i].body_remaining) + 1024
+        if needed > MAX_BUF_BYTES:
+            return False
+        var dst = malloc_bytes(needed)
+        var src = retracked(self.slots[i].recv_buf) + Int(self.slots[i].req_start)
+        var k = 0
+        while k < preserve:
+            dst[k] = src[k]
+            k += 1
+        free_bytes(retracked(self.slots[i].recv_buf))
+        self.slots[i].recv_buf = untrack(dst)
+        self.slots[i].buf_size = Int32(needed)
+        self.slots[i].buf_off = Int32(used - Int(self.slots[i].req_start))
+        self.slots[i].req_start = Int32(0)
+        return True
+
     def handle_readable[resolve: ResolverFn](
         mut self,
         routes: RouteTable,
@@ -542,21 +604,39 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         keys: RequestHeaderKeys,
         i: Int,
     ):
-        """Read whatever arrived and push the state machine forward."""
+        """Read whatever arrived and push the state machine forward.
+
+        A buffer with no recv room while a body is still pending (PHASE_READ_BODY,
+        body_remaining > 0) now GROWS the slot buffer instead of closing: the
+        pre-v0.7.1 close here RST'd every request whose head+body exceeded
+        buf_cap, because close(2) with unread receive data resets the connection
+        and destroys the in-flight response. Oversized HEADERS still hit the
+        MAX_HEAD_BYTES close in advance_state; a Content-Length beyond
+        MAX_BODY_BYTES is rejected there too, so growth stays bounded."""
         if Int(self.slots[i].fd) < 0:
             return
         var fd = self.slots[i].fd
-        var buf = retracked(self.slots[i].recv_buf)
+        var cap = Int(self.slots[i].buf_size)
         var used = Int(self.slots[i].buf_off) + Int(self.slots[i].data_len)
-        if used >= self.buf_cap:
+        if used >= cap:
             self.advance_state[resolve](routes, responses, keys, i)
             if Int(self.slots[i].fd) < 0:
                 return
-            if (Int(self.slots[i].buf_off) + Int(self.slots[i].data_len)) >= self.buf_cap:
-                self.close_conn(i)
-                return
             used = Int(self.slots[i].buf_off) + Int(self.slots[i].data_len)
-        var n = recv_bytes(fd, buf + used, self.buf_cap - used)
+            if used >= cap:
+                if (
+                    Int(self.slots[i].phase) == PHASE_READ_BODY
+                    and Int(self.slots[i].body_remaining) > 0
+                ):
+                    if not self.grow_buffer(i, used):
+                        self.close_conn(i)
+                        return
+                    cap = Int(self.slots[i].buf_size)
+                else:
+                    self.close_conn(i)
+                    return
+        var buf = retracked(self.slots[i].recv_buf)
+        var n = recv_bytes(fd, buf + used, cap - used)
         if Int(n) < 0:
             if errno_now() == EINTR_CODE:
                 return
@@ -611,6 +691,7 @@ def conn_table(config: WorkerConfig) -> ConnTable:
         fd=Int32(-1),
         recv_buf=null_bytes(),
         has_recv_buf=False,
+        buf_size=Int32(0),
         buf_off=Int32(0),
         data_len=Int32(0),
         phase=Int32(-1),
@@ -628,6 +709,7 @@ def conn_table(config: WorkerConfig) -> ConnTable:
         dyn_data=null_bytes(),
         dyn_len=Int32(0),
         dyn_owned=False,
+        drain_deadline_ms=Int64(0),
     )
     var j = 0
     while j < capacity:
@@ -953,6 +1035,7 @@ def worker_loop[resolve: ResolverFn](
         if parent_pid() != boot_ppid:
             exit_now(ORPHAN_EXIT_CODE)
         var count = 1
+        var now_ms = Int64(monotonic_ms())
         conns.poll_fds[0] = PollFd(fd=source_fd, events=POLLIN, revents=UInt16(0))
         conns.poll_map[0] = Int32(-1)
         var j = 0
@@ -960,13 +1043,20 @@ def worker_loop[resolve: ResolverFn](
         while j < conns.capacity and remaining > 0:
             var fd = conns.slots[j].fd
             if Int(fd) >= 0:
-                var events: Int = Int(POLLIN)
-                if Int(conns.slots[j].write_remaining) > 0:
-                    events = events | Int(POLLOUT)
-                conns.poll_fds[count] = PollFd(fd=fd, events=UInt16(events), revents=UInt16(0))
-                conns.poll_map[count] = Int32(j)
-                count += 1
-                remaining -= 1
+                if (
+                    Int(conns.slots[j].phase) == PHASE_READ_BODY
+                    and Int(conns.slots[j].body_remaining) > 0
+                    and now_ms >= conns.slots[j].drain_deadline_ms
+                ):
+                    conns.close_conn(j)
+                else:
+                    var events: Int = Int(POLLIN)
+                    if Int(conns.slots[j].write_remaining) > 0:
+                        events = events | Int(POLLOUT)
+                    conns.poll_fds[count] = PollFd(fd=fd, events=UInt16(events), revents=UInt16(0))
+                    conns.poll_map[count] = Int32(j)
+                    count += 1
+                    remaining -= 1
             j += 1
         var ready = wait_on_poll_timeout(conns.poll_fds, count, WORKER_POLL_TICK_MS)
         if ready <= 0:

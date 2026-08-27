@@ -38,6 +38,7 @@ comptime POLLOUT = UInt16(0x0004)
 comptime POLLERR = UInt16(0x0008)
 comptime POLLHUP = UInt16(0x0010)
 comptime POLLNVAL = UInt16(0x0020)
+comptime CLOCK_MONOTONIC = c_int(6)
 comptime EAGAIN_CODE = 35
 comptime EINTR_CODE = 4
 comptime SIGPIPE_SIGNAL = 13
@@ -83,6 +84,22 @@ def min_int(a: Int, b: Int) -> Int:
     if a < b:
         return a
     return b
+
+
+@fieldwise_init
+struct Timespec(RegisterPassable):
+    """Layout twin of Darwin's `struct timespec` (two 64-bit longs)."""
+
+    var sec: Int
+    var nsec: Int
+
+
+def monotonic_ms() -> Int:
+    """CLOCK_MONOTONIC in milliseconds; immune to wall-clock steps, so it is
+    the only safe clock for connection deadlines (drain idle timeout)."""
+    var ts = Timespec(sec=0, nsec=0)
+    _ = external_call["clock_gettime", c_int](CLOCK_MONOTONIC, Pointer(to=ts))
+    return Int(ts.sec) * 1000 + Int(ts.nsec) // 1000000
 
 
 def errno_now() -> Int:
