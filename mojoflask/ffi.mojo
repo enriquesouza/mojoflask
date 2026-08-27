@@ -31,6 +31,8 @@ comptime SCM_RIGHTS = c_int(1)
 comptime SO_REUSEADDR = c_int(4)
 comptime SO_REUSEPORT = c_int(0x200)
 comptime O_RDONLY = c_int(0)
+comptime IPPROTO_TCP = c_int(6)
+comptime TCP_NODELAY = c_int(1)
 comptime POLLIN = UInt16(0x0001)
 comptime POLLOUT = UInt16(0x0004)
 comptime POLLERR = UInt16(0x0008)
@@ -185,21 +187,41 @@ def load_u32_le(p: BytePtr) -> Int:
     return Int(p[0]) | (Int(p[1]) << 8) | (Int(p[2]) << 16) | (Int(p[3]) << 24)
 
 
-def send_fd(pair_fd: Int32, fd_to_send: Int32) -> Bool:
-    """Send one file descriptor over a Unix socketpair via SCM_RIGHTS.
+@fieldwise_init
+struct FdPassScratch(RegisterPassable):
+    """Preallocated msghdr/iov/cmsg buffers for SCM_RIGHTS passing.
 
-    Builds a minimal msghdr: one 1-byte iov plus one 16-byte cmsghdr whose
-    payload is the descriptor itself. All structs are hand-poked because the
-    FFI layer cannot express the C unions involved.
-    """
-    var pay = malloc_bytes(1)
-    var iov = malloc_bytes(16)
-    var cm = malloc_bytes(16)
-    var mh = malloc_bytes(48)
+    send_fd/recv_fd used to malloc and free EIGHT small buffers per passed
+    descriptor; under reconnect storms (worker respawn during miss storms)
+    that put the allocator on the parent's hot path. One scratch per loop,
+    allocated once at startup, is reused for every pass. Fields are stored
+    as UntrackedBytePtr because Mojo struct fields cannot expose AnyOrigin;
+    helpers recover tracked pointers locally via retracked()."""
+
+    var pay: UntrackedBytePtr
+    var iov: UntrackedBytePtr
+    var cm: UntrackedBytePtr
+    var mh: UntrackedBytePtr
+
+
+def fd_pass_scratch() -> FdPassScratch:
+    """Allocate the never-freed process-lifetime fd-passing buffers."""
+    return FdPassScratch(
+        pay=untrack(malloc_bytes(1)),
+        iov=untrack(malloc_bytes(16)),
+        cm=untrack(malloc_bytes(32)),
+        mh=untrack(malloc_bytes(48)),
+    )
+
+
+def _fill_send_msghdr(s: FdPassScratch, fd_to_send: Int32):
+    var iov = retracked(s.iov)
+    var cm = retracked(s.cm)
+    var mh = retracked(s.mh)
     zero_bytes(iov, 16)
     zero_bytes(cm, 16)
     zero_bytes(mh, 48)
-    store_u64_le(iov, Int(pay))
+    store_u64_le(iov, Int(retracked(s.pay)))
     store_u64_le(iov + 8, 1)
     store_u32_le(cm, 16)
     store_u32_le(cm + 4, Int(SOL_SOCKET))
@@ -209,42 +231,56 @@ def send_fd(pair_fd: Int32, fd_to_send: Int32) -> Bool:
     store_u64_le(mh + 24, 1)
     store_u64_le(mh + 32, Int(cm))
     store_u32_le(mh + 40, 16)
-    var r = external_call["sendmsg", c_ssize_t](pair_fd, mh, c_int(0))
-    free_bytes(pay)
-    free_bytes(iov)
-    free_bytes(cm)
-    free_bytes(mh)
-    return Int(r) > 0
 
 
-def recv_fd(pair_fd: Int32) -> Int:
-    """Receive one file descriptor over a socketpair; returns -1 on failure.
-
-    Mirrors send_fd: the 32-byte control buffer is scanned for a SOL_SOCKET /
-    SCM_RIGHTS control message and the embedded descriptor is extracted.
-    """
-    var pay = malloc_bytes(1)
-    var iov = malloc_bytes(16)
-    var cm = malloc_bytes(32)
-    var mh = malloc_bytes(48)
+def _fill_recv_msghdr(s: FdPassScratch):
+    var iov = retracked(s.iov)
+    var cm = retracked(s.cm)
+    var mh = retracked(s.mh)
     zero_bytes(iov, 16)
     zero_bytes(cm, 32)
     zero_bytes(mh, 48)
-    store_u64_le(iov, Int(pay))
+    store_u64_le(iov, Int(retracked(s.pay)))
     store_u64_le(iov + 8, 1)
     store_u64_le(mh + 16, Int(iov))
     store_u64_le(mh + 24, 1)
     store_u64_le(mh + 32, Int(cm))
     store_u32_le(mh + 40, 32)
-    var r = external_call["recvmsg", c_ssize_t](pair_fd, mh, c_int(0))
+
+
+def send_fd(pair_fd: Int32, fd_to_send: Int32, mut s: FdPassScratch) -> Bool:
+    """Send one file descriptor over a Unix socketpair via SCM_RIGHTS.
+
+    Builds a minimal msghdr: one 1-byte iov plus one 16-byte cmsghdr whose
+    payload is the descriptor itself. All structs are hand-poked because the
+    FFI layer cannot express the C unions involved; the backing memory comes
+    from the caller-owned scratch so the hot path allocates nothing.
+
+    The caller MUST verify writability first (poll_single POLLOUT timeout 0):
+    these are blocking sockets, so an unchecked sendmsg parks the process
+    once the peer stops draining its pair.
+    """
+    _fill_send_msghdr(s, fd_to_send)
+    retracked(s.pay)[0] = UInt8(0)
+    var r = external_call["sendmsg", c_ssize_t](pair_fd, s.mh, c_int(0))
+    return Int(r) > 0
+
+
+def recv_fd(pair_fd: Int32, mut s: FdPassScratch) -> Int:
+    """Receive one file descriptor over a socketpair; returns -1 on failure.
+
+    Mirrors send_fd: the 32-byte control buffer is scanned for a SOL_SOCKET /
+    SCM_RIGHTS control message and the embedded descriptor is extracted.
+    Call only when poll single-entry reports POLLIN (else recvmsg blocks).
+    """
+    _fill_recv_msghdr(s)
+    var r = external_call["recvmsg", c_ssize_t](pair_fd, s.mh, c_int(0))
     var out = -1
     if Int(r) > 0:
-        if load_u32_le(cm + 4) == Int(SOL_SOCKET) and load_u32_le(cm + 8) == Int(SCM_RIGHTS):
-            out = load_u32_le(cm + 12)
-    free_bytes(pay)
-    free_bytes(iov)
-    free_bytes(cm)
-    free_bytes(mh)
+        if load_u32_le(retracked(s.cm) + 4) == Int(SOL_SOCKET) and load_u32_le(
+            retracked(s.cm) + 8
+        ) == Int(SCM_RIGHTS):
+            out = load_u32_le(retracked(s.cm) + 12)
     return out
 
 
@@ -272,11 +308,22 @@ def open_socket() -> Int32:
     return external_call["socket", c_int](AF_INET, SOCK_STREAM, c_int(0))
 
 
+def set_nodelay(fd: Int32):
+    """TCP_NODELAY on: Nagle off, mirroring rust-skinny main.rs (listener and
+    every accepted socket). Kills delayed-ACK stalls on multi-segment writes."""
+    var one = c_int(1)
+    _ = external_call["setsockopt", c_int](
+        fd, IPPROTO_TCP, TCP_NODELAY, Pointer(to=one), c_int(4)
+    )
+
+
 def create_listen_socket(port: Int, backlog: Int) -> Int32:
     """SO_REUSEADDR+SO_REUSEPORT socket bound to 0.0.0.0:port and listening.
 
     On Darwin SO_REUSEPORT does NOT balance across listeners (see server
     module doc); it is still set so a crashed predecessor's port releases.
+    Also stamps TCP_NODELAY so accepted sockets inherit it (set again
+    explicitly per accepted fd — belt and suspenders).
     """
     var lfd = open_socket()
     if Int(lfd) < 0:
@@ -284,6 +331,7 @@ def create_listen_socket(port: Int, backlog: Int) -> Int32:
     var one = c_int(1)
     external_call["setsockopt", c_int](lfd, SOL_SOCKET, SO_REUSEADDR, Pointer(to=one), c_int(4))
     external_call["setsockopt", c_int](lfd, SOL_SOCKET, SO_REUSEPORT, Pointer(to=one), c_int(4))
+    set_nodelay(lfd)
     var sa = SockAddrIn(
         sin_len=UInt8(16),
         sin_family=UInt8(2),
@@ -300,7 +348,7 @@ def create_listen_socket(port: Int, backlog: Int) -> Int32:
 
 
 def accept_connection(lfd: Int32) -> Int32:
-    """Accept one connection; -1 on failure."""
+    """Accept one connection; -1 on failure. TCP_NODELAY stamped on success."""
     var ca = SockAddrIn(
         sin_len=UInt8(0),
         sin_family=UInt8(0),
@@ -309,7 +357,10 @@ def accept_connection(lfd: Int32) -> Int32:
         sin_zero=UInt64(0),
     )
     var slen = UInt32(16)
-    return external_call["accept", c_int](lfd, Pointer(to=ca), Pointer(to=slen))
+    var cfd = external_call["accept", c_int](lfd, Pointer(to=ca), Pointer(to=slen))
+    if Int(cfd) >= 0:
+        set_nodelay(cfd)
+    return cfd
 
 
 def close_fd(fd: Int32):
@@ -349,6 +400,24 @@ def wait_on_poll_timeout(fds: UntrackedPollFdPtr, n: Int, timeout_ms: Int) -> In
     SIGCHLD) lands mid-wait."""
     var r = external_call["poll", c_int](fds, c_int(n), c_int(timeout_ms))
     return Int(r)
+
+
+def poll_single(fd: Int32, events: UInt16, timeout_ms: Int) -> Int:
+    """poll() over exactly ONE descriptor on the stack.
+
+    The non-blocking gate this codebase leans on everywhere: every socket
+    here stays BLOCKING (no fcntl via variadic FFI), so before any accept,
+    sendmsg or extra recvmsg beyond the one an outer poll already justified,
+    poll_single(fd, POLLIN/POLLOUT, 0) answers "is it safe RIGHT NOW".
+    Returns poll's raw count of ready entries (>0 means go).
+    """
+    var pfd = PollFd(fd=fd, events=events, revents=UInt16(0))
+    return Int(external_call["poll", c_int](Pointer(to=pfd), c_int(1), c_int(timeout_ms)))
+
+
+def parent_pid() -> Int32:
+    """getppid(): lets a forked worker detect it has been orphaned."""
+    return external_call["getppid", c_int]()
 
 
 def send_bytes(fd: Int32, p: BytePtr, n: Int) -> Int:

@@ -136,6 +136,7 @@ from mojoflask.ffi import (
     errno_now,
     exit_now,
     fatal,
+    fd_pass_scratch,
     fork_process,
     ignore_sigpipe,
     malloc_bytes,
@@ -145,14 +146,16 @@ from mojoflask.ffi import (
     min_int,
     null_bytes,
     open_socket,
+    parent_pid,
+    poll_single,
     recv_bytes,
     recv_fd,
     retracked,
     send_bytes,
     send_fd,
+    set_nodelay,
     socketpair,
     untrack,
-    wait_on_poll,
     wait_on_poll_timeout,
     waitpid_nohang,
 )
@@ -187,6 +190,12 @@ comptime CANARY_KEY_CAP = 64
 comptime RESPAWN_CAP = 50
 comptime SUPERVISE_POLL_MS = 100
 comptime REAP_EVERY_ACCEPTS = 256
+comptime ACCEPT_BURST = 64
+# Worker-side orphan watchdog cadence: the worker poll waits at most this long
+# so a parent death is detected (via getppid()) even on fully idle workers,
+# whose poll would otherwise block forever.
+comptime WORKER_POLL_TICK_MS = 500
+comptime ORPHAN_EXIT_CODE = 9
 
 # Padded per-slot stride for the heap allocation backing ConnTable; generous
 # on purpose so field additions never under-allocate.
@@ -267,11 +276,18 @@ struct ConnState(RegisterPassable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct ConnTable(RegisterPassable, ImplicitlyCopyable):
-    """Fixed-size pool of ConnStates plus its poll scratch arrays."""
+    """Fixed-size pool of ConnStates plus its poll scratch arrays.
+
+    `live` tracks how many slots currently hold an open descriptor so the
+    per-wakeup poll-array rebuild can stop after the last occupied slot
+    instead of scanning all `capacity` entries (4096 at default config) every
+    single event loop iteration.
+    """
 
     var slots: Pointer[T=ConnState, mut=True, origin=UntrackedOrigin[mut=True]]
     var capacity: Int
     var buf_cap: Int
+    var live: Int32
     var poll_fds: UntrackedPollFdPtr
     var poll_map: UntrackedInt32Ptr
 
@@ -281,6 +297,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         var fd = self.slots[i].fd
         if Int(fd) >= 0:
             close_fd(fd)
+            self.live = self.live - Int32(1)
         self.slots[i].fd = Int32(-1)
 
     def release_dynamic(mut self, i: Int):
@@ -312,6 +329,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         if slot < 0:
             close_fd(cfd)
             return
+        set_nodelay(cfd)
         if not self.slots[slot].has_recv_buf:
             self.slots[slot].recv_buf = untrack(malloc_bytes(self.buf_cap))
             self.slots[slot].has_recv_buf = True
@@ -332,6 +350,7 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
         self.slots[slot].dyn_data = null_bytes()
         self.slots[slot].dyn_len = Int32(0)
         self.slots[slot].dyn_owned = False
+        self.live = self.live + Int32(1)
 
     def flush_write(mut self, i: Int):
         """Send more of the latched response; finish or keep-alive on completion."""
@@ -618,6 +637,7 @@ def conn_table(config: WorkerConfig) -> ConnTable:
         slots=slots,
         capacity=capacity,
         buf_cap=config.buf_cap,
+        live=Int32(0),
         poll_fds=malloc_pollfds(capacity + 1),
         poll_map=UntrackedInt32Ptr(unsafe_from_address=Int(malloc_bytes(4 * (capacity + 1)))),
     )
@@ -803,36 +823,64 @@ def supervised_acceptor[resolve: ResolverFn](
     """Parent-side acceptor AND supervisor: hand accepted fds round-robin to
     live workers, re-fork dead ones from this still-healthy parent.
 
-    Polling the listener with a 100ms timeout replaces the old block-forever
-    wait so the loop also wakes to reap: waitpid(WNOHANG) sweeps every worker
-    each timeout (plus every REAP_EVERY_ACCEPTS accepts under load, plus the
-    EINTR a SIGCHLD delivers mid-poll). A dead slot is skipped by dispatch
-    until its respawn completes — queued fds ride the surviving socketpair
-    endpoint and are drained by the fresh child — and respawn retries are
-    capped at RESPAWN_CAP per worker slot before the parent gives up
-    fatally. Any death counts (canary exit 70, allocator signal, worker
-    crash); the poisoning rate per fork makes N consecutive bad spawns
-    vanishingly unlikely, so the cap only trips on true systemic failure."""
+    Accepted connections are drained in batches of up to ACCEPT_BURST per
+    readable wakeup — but every accept BEYOND the one the outer poll already
+    justified is gated by poll_single(listener, POLLIN, 0): these sockets are
+    blocking (no fcntl via variadic FFI), so an ungated drain parks the whole
+    parent inside accept() once pending connects dip below the cap, freezing
+    reaping/respawning until a random future connection lands (the v0.6.x
+    successor's first wedge).
+
+    Each dispatch probes the target pair with poll_single(POLLOUT, 0) BEFORE
+    send_fd: an unchecked sendmsg onto a socketpair whose worker stopped
+    draining (synchronous PQexec stall, blocked client write) fills its pair
+    buffer and blocks the parent in the kernel forever — every later connect
+    then hangs unanswered in the listen backlog while the port keeps
+    listening. Un-writable/dead slots are skipped round-robin; a connection
+    that finds NO healthy pair is closed so the client retries elsewhere
+    instead of one stalled worker serializing the entire tree.
+
+    Every 100ms tick — or every REAP_EVERY_ACCEPTS accepted fds under load —
+    the loop wakes to reap: waitpid(WNOHANG) sweeps every worker. A dead slot
+    is skipped by dispatch until its respawn completes — queued fds ride the
+    surviving socketpair endpoint and are drained by the fresh child — and
+    respawn retries are capped at RESPAWN_CAP per worker slot before the
+    parent gives up fatally."""
     var next_worker = 0
     var since_reap = 0
     var single = malloc_pollfds(1)
     var status_out = malloc_int32s(1)
+    var scratch = fd_pass_scratch()
     while True:
         single[0] = PollFd(fd=listener, events=POLLIN, revents=UInt16(0))
         var ready = wait_on_poll_timeout(single, 1, SUPERVISE_POLL_MS)
         if ready > 0:
-            var cfd = accept_connection(listener)
-            if Int(cfd) >= 0:
-                var target = next_worker % worker_count
+            var burst = 0
+            while burst < ACCEPT_BURST:
+                var cfd = accept_connection(listener)
+                if Int(cfd) < 0:
+                    break
+                var sent = False
                 var probes = 0
-                while (Int(alive[target]) == 0) and (probes < worker_count):
-                    target = (target + 1) % worker_count
+                while probes < worker_count:
+                    var target = (next_worker + probes) % worker_count
+                    if Int(alive[target]) == 1 and poll_single(
+                        pairs[target * 2], POLLOUT, 0
+                    ) > 0:
+                        _ = send_fd(pairs[target * 2], cfd, scratch)
+                        sent = True
+                        next_worker = target + 1
+                        break
                     probes += 1
-                if Int(alive[target]) == 1:
-                    _ = send_fd(pairs[target * 2], cfd)
                 close_fd(cfd)
-                next_worker = target + 1
-            since_reap += 1
+                burst += 1
+                if not sent and worker_count > 0:
+                    # No live pair accepted right now: stop feeding conns
+                    # into a saturated tree this tick; supervision resumes.
+                    break
+                if poll_single(listener, POLLIN, 0) <= 0:
+                    break
+            since_reap += burst
         var reap_now = ready <= 0 or since_reap >= REAP_EVERY_ACCEPTS
         if reap_now:
             since_reap = 0
@@ -881,19 +929,35 @@ def worker_loop[resolve: ResolverFn](
 
     Entry 0 of the poll array watches the fd source — the SCM_RIGHTS pair
     when fanned out, otherwise the listener directly. Remaining entries map
-    through poll_map to ConnTable slots.
+    through poll_map to ConnTable slots; the rebuild stops after the last
+    occupied slot by tracking how many live connections remain to place.
+
+    Orphan watchdog: the parent has no signal-based teardown path (Mojo's
+    variadic FFI cannot install C signal handlers), so every iteration checks
+    getppid() against the value captured at boot; a worker whose parent died
+    _exits immediately instead of surviving with PPID=1 holding inherited
+    listening descriptors. The main poll waits at most WORKER_POLL_TICK_MS so
+    fully idle workers tick the check too. Each source-readable pass drains
+    additional queued receipts gated by poll_single(POLLIN, 0) — never more
+    than DRAIN_BURST — so reconnect storms flush in one wakeup instead of
+    one full loop per passed descriptor.
     """
     var conns = conn_table(config)
     var source_fd = listener
     if Int(pair_fd) >= 0:
         source_fd = pair_fd
+    var scratch = fd_pass_scratch()
+    var boot_ppid = parent_pid()
     print("mojoflask worker pid=", current_pid(), " port=", config.port)
     while True:
+        if parent_pid() != boot_ppid:
+            exit_now(ORPHAN_EXIT_CODE)
         var count = 1
         conns.poll_fds[0] = PollFd(fd=source_fd, events=POLLIN, revents=UInt16(0))
         conns.poll_map[0] = Int32(-1)
         var j = 0
-        while j < conns.capacity:
+        var remaining = Int(conns.live)
+        while j < conns.capacity and remaining > 0:
             var fd = conns.slots[j].fd
             if Int(fd) >= 0:
                 var events: Int = Int(POLLIN)
@@ -902,18 +966,31 @@ def worker_loop[resolve: ResolverFn](
                 conns.poll_fds[count] = PollFd(fd=fd, events=UInt16(events), revents=UInt16(0))
                 conns.poll_map[count] = Int32(j)
                 count += 1
+                remaining -= 1
             j += 1
-        var ready = wait_on_poll(conns.poll_fds, count)
+        var ready = wait_on_poll_timeout(conns.poll_fds, count, WORKER_POLL_TICK_MS)
         if ready <= 0:
             continue
         if conns.poll_fds[0].revents != UInt16(0):
-            var cfd = Int32(-1)
-            if Int(pair_fd) >= 0:
-                cfd = Int32(recv_fd(pair_fd))
-            else:
-                cfd = accept_connection(listener)
-            if Int(cfd) >= 0:
-                conns.register_connection(cfd)
+            # First receipt is justified by the entry-0 event itself; each
+            # EXTRA step is gated by a 0-timeout poll so neither recvmsg nor
+            # accept can ever park this worker's event loop. A worker that
+            # stops draining its pair backpressures the parent into the
+            # POLLOUT skip path instead of wedging the whole tree.
+            var got = 0
+            while got < ACCEPT_BURST:
+                var cfd = Int32(-1)
+                if Int(pair_fd) >= 0:
+                    cfd = Int32(recv_fd(pair_fd, scratch))
+                else:
+                    cfd = accept_connection(listener)
+                if Int(cfd) >= 0:
+                    conns.register_connection(cfd)
+                    got += 1
+                    if poll_single(source_fd, POLLIN, 0) <= 0:
+                        break
+                else:
+                    break
         var q = 1
         while q < count:
             var rev = Int(conns.poll_fds[q].revents)
