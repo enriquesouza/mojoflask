@@ -15,6 +15,9 @@ repository = "https://github.com/enriquesouza/mojoflask"
 [tasks]
 build-example = { cmd = "mojo build -I . examples/hello.mojo -o hello", env = { MOJOFLASK_PORT = "18090" } }
 run-example = "./hello"
+build-bench-echo = "mojo build -I . examples/bench_echo.mojo -o bench_echo"
+bench-echo = "sh tools/bench_echo.sh"
+wedge-probe = "sh tools/wedge_probe.sh"
 precompile = "mojo precompile mojoflask -o mojoflask.mojoc"
 
 [dependencies]

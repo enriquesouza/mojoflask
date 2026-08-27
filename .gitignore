@@ -4,3 +4,6 @@ hello
 __pycache__/
 .DS_Store
 *.conda
+bench_echo
+bench_echo_w063
+bench_echo_w070
