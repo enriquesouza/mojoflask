@@ -8,6 +8,14 @@ Public API
     response_set()               route-indexed table of prebuilt responses
     ParsedBody / parse_json_body()
                                   EmberJson-backed flat request-body decoding
+    reqscan helpers               raw_query_text_from_request_line(),
+                                  find_query_parameter_value(),
+                                  url_path_segment_as_range/_as_string(),
+                                  request_body_range()
+    text helpers                  whitespace trims, ASCII lowercase, fold,
+                                  literal compares over byte ranges,
+                                  byte-range String materialization,
+                                  utf8_rune_at() validating UTF-8 decode
     WorkerConfig / worker_config_from_env()
     serve(config, routes, responses)
                                   bind + fork + poll event loop, never returns
@@ -55,6 +63,14 @@ from .http import (
     standard_header_keys,
 )
 
+from .reqscan import (
+    find_query_parameter_value,
+    raw_query_text_from_request_line,
+    request_body_range,
+    url_path_segment_as_range,
+    url_path_segment_as_string,
+)
+
 from .router import (
     METHOD_ANY,
     METHOD_DELETE,
@@ -82,4 +98,22 @@ from .server import (
     serve_dynamic,
     worker_config,
     worker_config_from_env,
+)
+
+from .text import (
+    ascii_char,
+    contains_only_whitespace,
+    has_visible_content,
+    lowercase_ascii_letters_only,
+    materialize_buffer_pointer_as_string,
+    materialize_byte_range_as_string_charwise,
+    normalize_fold,
+    range_equals_literal,
+    range_equals_literal_at_offset,
+    range_equals_literal_precomputed_length,
+    remove_space_and_tab_only,
+    remove_trailing_slashes,
+    trim_space_tab_newline_carriage_return_around,
+    trim_whitespace_characters_around,
+    utf8_rune_at,
 )

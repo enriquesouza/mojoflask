@@ -202,8 +202,10 @@ that), TLS, HTTP/2 — put nginx/Caddy in front if you need those today.
 | `bodyjson.mojo` | EmberJson-backed flat request-body decoding into a register struct; ASCII scanners cover numbers-as-strings |
 | `ffi.mojo` | every libc/POSIX touchpoint: sockets, malloc, errno, poll structs, SCM_RIGHTS fd passing. All Darwin quirks documented inline. |
 | `http.mojo` | HTTP/1.1 head parsing (method code, path, Content-Length, Connection) and response assembly |
+| `reqscan.mojo` | request-head scanning over raw (BytePtr, head_len) spans: query-text range, first-match query-parameter lookup, nth path segment, body-span views |
 | `router.mojo` | pattern strings -> segment matchers (`literal`, `{name}` any, `{name:d}` digits) with per-route method masks; resolution is a linear segment walk, no allocations |
 | `server.mojo` | connection state pool, poll(2) event loop, pre-fork acceptor that round-robins accepted fds to workers over Unix socketpairs, keep-alive state machine |
+| `text.mojo` | ASCII text normalization: whitespace-class trims, ASCII-only lowercasing, fold, StaticString literal compares over byte ranges, byte-range String materialization, validating UTF-8 rune decode |
 
 ### Darwin quirks encoded here (read before porting)
 
@@ -223,8 +225,10 @@ mojoflask/__init__.mojo   public API surface
 mojoflask/bodyjson.mojo   request-body JSON (EmberJson)
 mojoflask/ffi.mojo        libc layer (the only ugly file, quarantined)
 mojoflask/http.mojo       parsing + assembly
+mojoflask/reqscan.mojo    request-head scanners (query text, params, path segments)
 mojoflask/router.mojo     RouteTable
 mojoflask/server.mojo     event loop + workers + serve()
+mojoflask/text.mojo       text normalization + UTF-8 rune decode
 examples/hello.mojo           minimal app
 ```
 
