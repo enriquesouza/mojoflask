@@ -97,6 +97,7 @@ from .server import (
     conn_table,
     serve,
     serve_dynamic,
+    serve_dynamic_with_init,
     worker_config,
     worker_config_from_env,
 )

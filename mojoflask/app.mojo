@@ -47,11 +47,13 @@ from .router import (
     route_table,
 )
 from .server import (
+    WorkerInitFn,
     DynamicOut,
     ResolverFn,
     WorkerConfig,
     serve,
     serve_dynamic,
+    serve_dynamic_with_init,
     worker_config,
     worker_config_from_env,
 )
@@ -238,6 +240,17 @@ struct App(Movable):
         returns.
         """
         serve_dynamic[resolve](self.config, self.routes, self.responses)
+
+
+    def run_dynamic_with_init[
+        resolve: ResolverFn, worker_init: WorkerInitFn
+    ](self):
+        """run_dynamic with a per-worker init hook: the hook runs once in
+        EVERY forked worker before the poll loop — pre-warm pools/caches so
+        no first request pays the cold cost."""
+        serve_dynamic_with_init[resolve, worker_init](
+            self.config, self.routes, self.responses
+        )
 
 
 def app_from_env(default_port: Int, arena_mb: Int = 4, server_name: String = "mojoflask") -> App:

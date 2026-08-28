@@ -225,6 +225,8 @@ comptime ResolverFn = def(
     Int, UInt8, BytePtr, Int, BytePtr, Int, mut DynamicOut
 ) thin -> Bool
 
+comptime WorkerInitFn = def() thin -> None
+
 
 @fieldwise_init
 struct DynamicOut(RegisterPassable):
@@ -862,7 +864,7 @@ def allocator_canary(iterations: Int) -> Bool:
     return slot_canary(CANARY_SLOT_COUNT, iterations)
 
 
-def spawn_worker[resolve: ResolverFn](
+def spawn_worker[resolve: ResolverFn, worker_init: WorkerInitFn](
     listener: Int32,
     pairs: Int32Ptr,
     slot: Int,
@@ -883,14 +885,14 @@ def spawn_worker[resolve: ResolverFn](
     if Int(child_pid) == 0:
         if not allocator_canary(CANARY_ITERATIONS):
             exit_now(CANARY_EXIT_CODE)
-        worker_loop[resolve](
+        worker_loop[resolve, worker_init](
             listener, pairs[slot * 2 + 1], config, routes, responses, keys
         )
         exit_now(0)
     return child_pid
 
 
-def supervised_acceptor[resolve: ResolverFn](
+def supervised_acceptor[resolve: ResolverFn, worker_init: WorkerInitFn](
     listener: Int32,
     pairs: Int32Ptr,
     pids: Int32Ptr,
@@ -991,7 +993,7 @@ def supervised_acceptor[resolve: ResolverFn](
                             "); respawn attempt ",
                             attempts[k],
                         )
-                    pids[k] = spawn_worker[resolve](
+                    pids[k] = spawn_worker[resolve, worker_init](
                         listener, pairs, k, config, routes, responses, keys
                     )
                     if Int(pids[k]) > 0:
@@ -999,7 +1001,7 @@ def supervised_acceptor[resolve: ResolverFn](
                 k += 1
 
 
-def worker_loop[resolve: ResolverFn](
+def worker_loop[resolve: ResolverFn, worker_init: WorkerInitFn](
     listener: Int32,
     pair_fd: Int32,
     config: WorkerConfig,
@@ -1024,6 +1026,7 @@ def worker_loop[resolve: ResolverFn](
     than DRAIN_BURST — so reconnect storms flush in one wakeup instead of
     one full loop per passed descriptor.
     """
+    worker_init()
     var conns = conn_table(config)
     var source_fd = listener
     if Int(pair_fd) >= 0:
@@ -1127,7 +1130,11 @@ def serve(config: WorkerConfig, routes: RouteTable, responses: ResponseSet):
     those prebuilt buffers across workers, which is what keeps summed RSS low.
     Dynamic routes need serve_dynamic[] instead.
     """
-    _serve_impl[_static_noop](config, routes, responses)
+    _serve_impl[_static_noop, _no_worker_init](config, routes, responses)
+
+
+def _no_worker_init():
+    pass
 
 
 def serve_dynamic[resolve: ResolverFn](
@@ -1143,10 +1150,18 @@ def serve_dynamic[resolve: ResolverFn](
     module docstring for the full contract and the recv-buffer aliasing
     hazard). Static-only apps should keep plain serve().
     """
-    _serve_impl[resolve](config, routes, responses)
+    _serve_impl[resolve, _no_worker_init](config, routes, responses)
+
+def serve_dynamic_with_init[resolve: ResolverFn, worker_init: WorkerInitFn](
+    config: WorkerConfig, routes: RouteTable, responses: ResponseSet
+):
+    """serve_dynamic with a per-worker init hook: runs once in EVERY forked
+    worker before the poll loop starts — pre-warm pools, prepare statements,
+    seed caches so no first request pays the cold cost."""
+    _serve_impl[resolve, worker_init](config, routes, responses)
 
 
-def _serve_impl[resolve: ResolverFn](
+def _serve_impl[resolve: ResolverFn, worker_init: WorkerInitFn](
     config: WorkerConfig, routes: RouteTable, responses: ResponseSet
 ):
     """Shared boot: signals, fd reservation, bind, fork fan-out, loops."""
@@ -1175,13 +1190,13 @@ def _serve_impl[resolve: ResolverFn](
         var attempts = malloc_int32s(config.workers)
         var k2 = 0
         while k2 < config.workers:
-            pids[k2] = spawn_worker[resolve](
+            pids[k2] = spawn_worker[resolve, worker_init](
                 listener, pairs, k2, config, routes, responses, keys
             )
             alive[k2] = Int32(Int(pids[k2]) > 0)
             attempts[k2] = Int32(0)
             k2 += 1
-        supervised_acceptor[resolve](
+        supervised_acceptor[resolve, worker_init](
             listener,
             pairs,
             pids,
@@ -1194,4 +1209,4 @@ def _serve_impl[resolve: ResolverFn](
             keys,
         )
         return
-    worker_loop[resolve](listener, Int32(-1), config, routes, responses, keys)
+    worker_loop[resolve, worker_init](listener, Int32(-1), config, routes, responses, keys)
