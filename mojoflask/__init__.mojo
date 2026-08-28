@@ -51,6 +51,7 @@ from .ffi import (
     untrack,
 )
 
+from .brotli import Brotli
 from .http import (
     MAX_RESPONSES,
     ParsedHead,
