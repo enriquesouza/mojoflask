@@ -30,7 +30,13 @@ from .ffi import (
     retracked,
     untrack,
 )
-from .http import ResponseBuffer, ResponseSet, build_response, response_set
+from .http import (
+    ResponseBuffer,
+    ResponseSet,
+    build_response,
+    build_response_exact,
+    response_set,
+)
 from .router import (
     METHOD_GET,
     METHOD_POST,
@@ -193,6 +199,19 @@ struct App(Movable):
         _ = self.responses.add(build_response(status, dst, n, self.server_name))
         self.arena_used += n
         return route
+
+    def fallback_exact(
+        mut self, status_line: String, body: String, content_type: String
+    ):
+        """Serve a raw prebuilt fallback: no Server header, the exact
+        Content-Type given (empty = omit). For canonical zero-byte 404s."""
+        var ptr: BytePtr = make_cstr(body)
+        self.responses.set_fallback(
+            build_response_exact(
+                status_line, ptr, body.byte_length(), content_type, False
+            )
+        )
+        free_bytes(ptr)
 
     def fallback(mut self, body: String):
         """Serve `body` with status 404 when no route matches."""

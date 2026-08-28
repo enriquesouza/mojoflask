@@ -248,6 +248,39 @@ def build_response(
     return ResponseBuffer(data=untrack(p), length=total)
 
 
+def build_response_exact(
+    status_line: String,
+    body: BytePtr,
+    body_len: Int,
+    content_type: String,
+    vary_accept_encoding: Bool,
+    extra_headers: String = "",
+) -> ResponseBuffer:
+    """Serialize a full HTTP response with EXACT header control: no Server
+    header, the Content-Type exactly as given (empty string = omit), an
+    extra `Vary: Accept-Encoding` line when the flag is set, and any
+    extra header lines given (each must carry its own trailing CRLF).
+    The fixed security-header tail is appended as in build_response."""
+    var head_pre = "HTTP/1.1 " + status_line + "\r\n"
+    if content_type:
+        head_pre += "Content-Type: " + content_type + "\r\n"
+    if vary_accept_encoding:
+        head_pre += "Vary: Accept-Encoding\r\n"
+    if extra_headers:
+        head_pre += extra_headers
+    head_pre += "Content-Length: "
+    var total = head_pre.byte_length() + decimal_digit_count(body_len) + HEADER_TAIL.byte_length() + body_len
+    var p = malloc_bytes(total)
+    var at = append_string(p, 0, head_pre)
+    at = write_decimal(p, at, body_len)
+    at = append_string(p, at, HEADER_TAIL)
+    var i = 0
+    while i < body_len:
+        p[at + i] = body[i]
+        i += 1
+    return ResponseBuffer(data=untrack(p), length=total)
+
+
 def find_header_end(p: BytePtr, start: Int, end: Int) -> Int:
     """Offset of the CRLFCRLF that terminates the request head, else -1.
 
