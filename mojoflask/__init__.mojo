@@ -10,11 +10,16 @@ Public API
                                   EmberJson-backed flat request-body decoding
     reqscan helpers               raw_query_text_from_request_line(),
                                   find_query_parameter_value(),
+                                  query_parameter_value_as_string(),
                                   url_path_segment_as_range/_as_string(),
+                                  case_insensitive_prefix_at(),
+                                  host_header_value(),
+                                  request_accepts_brotli(),
                                   request_body_range()
     text helpers                  whitespace trims, ASCII lowercase, fold,
                                   literal compares over byte ranges,
                                   byte-range String materialization,
+                                  percent_encode_unreserved(),
                                   utf8_rune_at() validating UTF-8 decode
     WorkerConfig / worker_config_from_env()
     serve(config, routes, responses)
@@ -66,8 +71,12 @@ from .http import (
 )
 
 from .reqscan import (
+    case_insensitive_prefix_at,
     find_query_parameter_value,
+    host_header_value,
+    query_parameter_value_as_string,
     raw_query_text_from_request_line,
+    request_accepts_brotli,
     request_body_range,
     url_path_segment_as_range,
     url_path_segment_as_string,
@@ -111,6 +120,7 @@ from .text import (
     materialize_buffer_pointer_as_string,
     materialize_byte_range_as_string_charwise,
     normalize_fold,
+    percent_encode_unreserved,
     range_equals_literal,
     range_equals_literal_at_offset,
     range_equals_literal_precomputed_length,

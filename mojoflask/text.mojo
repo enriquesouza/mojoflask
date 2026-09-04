@@ -208,6 +208,44 @@ def ascii_char(c: Int) -> String:
     ))
 
 
+def percent_encode_unreserved(text: String) -> String:
+    """RFC 3986 unreserved-reserved percent-encoding over the raw bytes.
+
+        Every byte that is an ASCII letter, digit, or one of `-_.~`
+        passes through as itself; EVERY other byte (including UTF-8
+        continuations and `/`) emits uppercase `%XX`. The scan walks the
+        String's raw bytes, so multibyte characters encode byte-at-a-time.
+
+    origin: alugue-mojo-api services/client_reads/_market_url.mojo
+    """
+    var percent_encoded_text = String()
+    for raw_byte in text.bytes():
+        var byte_value = Int(raw_byte)
+        if (
+            (byte_value >= 65 and byte_value <= 90)
+            or (byte_value >= 97 and byte_value <= 122)
+            or (byte_value >= 48 and byte_value <= 57)
+            or byte_value == 45
+            or byte_value == 95
+            or byte_value == 46
+            or byte_value == 126
+        ):
+            percent_encoded_text += ascii_char(byte_value)
+        else:
+            var high_nibble_value = byte_value >> 4
+            var low_nibble_value = byte_value & 15
+            percent_encoded_text += "%"
+            percent_encoded_text += ascii_char(
+                (48 + high_nibble_value) if high_nibble_value
+                < 10 else (55 + high_nibble_value)
+            )
+            percent_encoded_text += ascii_char(
+                (48 + low_nibble_value) if low_nibble_value
+                < 10 else (55 + low_nibble_value)
+            )
+    return percent_encoded_text
+
+
 def utf8_rune_at(bytes_ptr: BytePtr, pos: Int, remaining: Int) -> Tuple[Int, Int]:
     """(codepoint, width) of the UTF-8 sequence at bytes_ptr[pos], or (-1, width) on rejection.
 
