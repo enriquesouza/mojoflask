@@ -8,6 +8,9 @@ Public API
     response_set()               route-indexed table of prebuilt responses
     ParsedBody / parse_json_body()
                                   EmberJson-backed flat request-body decoding
+    IncomingRequest / serve_family()
+                                  the dynamic-handler request carrier and the
+                                  route-family trampoline (FamilyResolverFn)
     reqscan helpers               raw_query_text_from_request_line(),
                                   find_query_parameter_value(),
                                   query_parameter_value_as_string(),
@@ -85,6 +88,12 @@ from .http import (
     refresh_response_request_identity,
     response_set,
     standard_header_keys,
+)
+
+from .incoming_request import (
+    FamilyResolverFn,
+    IncomingRequest,
+    serve_family,
 )
 
 from .reqscan import (
