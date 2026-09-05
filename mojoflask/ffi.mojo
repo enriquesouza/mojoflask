@@ -39,6 +39,7 @@ comptime POLLERR = UInt16(0x0008)
 comptime POLLHUP = UInt16(0x0010)
 comptime POLLNVAL = UInt16(0x0020)
 comptime CLOCK_MONOTONIC = c_int(6)
+comptime CLOCK_REALTIME = c_int(0)
 comptime EAGAIN_CODE = 35
 comptime EINTR_CODE = 4
 comptime SIGPIPE_SIGNAL = 13
@@ -100,6 +101,47 @@ def monotonic_ms() -> Int:
     var ts = Timespec(sec=0, nsec=0)
     _ = external_call["clock_gettime", c_int](CLOCK_MONOTONIC, Pointer(to=ts))
     return Int(ts.sec) * 1000 + Int(ts.nsec) // 1000000
+
+
+def wall_clock_milliseconds() -> Int:
+    """CLOCK_REALTIME in milliseconds; wall-clock, so it steps with system
+    time changes — used only for identifiers that must resemble the boot
+    wall clock, never for measuring durations."""
+    var ts = Timespec(sec=0, nsec=0)
+    _ = external_call["clock_gettime", c_int](CLOCK_REALTIME, Pointer(to=ts))
+    return Int(ts.sec) * 1000 + Int(ts.nsec) // 1000000
+
+
+def wall_clock_nanoseconds() -> Int:
+    """CLOCK_REALTIME in nanoseconds since the epoch; wall-clock, so it
+    steps with system time changes — used only for identifiers that want
+    sub-millisecond separation between concurrent requests."""
+    var ts = Timespec(sec=0, nsec=0)
+    _ = external_call["clock_gettime", c_int](CLOCK_REALTIME, Pointer(to=ts))
+    return Int(ts.sec) * 1000000000 + Int(ts.nsec)
+
+
+def publish_environment_value(name: String, value: String) -> None:
+    """setenv(name, value, overwrite=1) with NUL-terminated C copies of the
+    Mojo strings; the buffers are leaked one-shot wiring, matching how the
+    reference runtime publishes pointer slots for late retrieval."""
+    var name_buffer = malloc_bytes(name.byte_length() + 1)
+    var name_bytes = name.as_bytes()
+    var byte_index = 0
+    while byte_index < len(name_bytes):
+        name_buffer[byte_index] = name_bytes[byte_index]
+        byte_index += 1
+    name_buffer[byte_index] = 0
+    var value_buffer = malloc_bytes(value.byte_length() + 1)
+    var value_bytes = value.as_bytes()
+    byte_index = 0
+    while byte_index < len(value_bytes):
+        value_buffer[byte_index] = value_bytes[byte_index]
+        byte_index += 1
+    value_buffer[byte_index] = 0
+    _ = external_call["setenv", c_int](
+        name_buffer, value_buffer, c_int(1)
+    )
 
 
 def errno_now() -> Int:

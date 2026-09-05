@@ -174,6 +174,7 @@ from mojoflask.http import (
     ResponseSet,
     find_header_end,
     parse_request_head,
+    refresh_response_request_identity,
     standard_header_keys,
 )
 
@@ -538,13 +539,15 @@ struct ConnTable(RegisterPassable, ImplicitlyCopyable):
             var pre = responses.at(out_buf.static_route)
             self.slots[i].resp_data = pre.data
             self.slots[i].resp_len = Int32(pre.length)
-            return
-        if out_buf.length > 0:
+        elif out_buf.length > 0:
             self.slots[i].dyn_data = out_buf.data
             self.slots[i].dyn_len = Int32(out_buf.length)
             self.slots[i].dyn_owned = out_buf.owns
             self.slots[i].resp_data = out_buf.data
             self.slots[i].resp_len = Int32(out_buf.length)
+        refresh_response_request_identity(
+            self.slots[i].resp_data, Int(self.slots[i].resp_len)
+        )
 
     def normalize_buffer(self, i: Int):
         """Compact the receive buffer so offsets never march past buf_cap.

@@ -46,8 +46,15 @@ comptime LETTER_P = UInt8(80)
 comptime LETTER_D = UInt8(68)
 comptime LETTER_Q = UInt8(81)
 
+from mojoflask.ffi import retracked
+from mojoflask.request_identity import (
+    REQUEST_IDENTITY_KEY,
+    REQUEST_IDENTITY_PLACEHOLDER_LINE,
+    fixed_width_request_identity,
+)
 
-comptime HEADER_TAIL = "\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'\r\nReferrer-Policy: strict-origin-when-cross-origin\r\nPermissions-Policy: geolocation=(), microphone=(), camera=()\r\nVary: origin\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Expose-Headers: retry-after\r\nConnection: keep-alive\r\n\r\n"
+
+comptime HEADER_TAIL = "\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'\r\nReferrer-Policy: strict-origin-when-cross-origin\r\nPermissions-Policy: geolocation=(), microphone=(), camera=()\r\nVary: origin\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Expose-Headers: retry-after,x-request-id\r\nConnection: keep-alive\r\n\r\n"
 comptime HEADER_CONTENT_LENGTH_KEY = "content-length:"
 comptime HEADER_CONNECTION_KEY = "connection:"
 comptime TOKEN_CLOSE = "close"
@@ -236,10 +243,11 @@ def build_response(
     buffer is immutable in practice. `server_name` fills the Server header.
     """
     var head_pre = "HTTP/1.1 " + status_line + "\r\nServer: " + server_name + "\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: "
-    var total = head_pre.byte_length() + decimal_digit_count(body_len) + HEADER_TAIL.byte_length() + body_len
+    var total = head_pre.byte_length() + decimal_digit_count(body_len) + REQUEST_IDENTITY_PLACEHOLDER_LINE.byte_length() + HEADER_TAIL.byte_length() + body_len
     var p = malloc_bytes(total)
     var at = append_string(p, 0, head_pre)
     at = write_decimal(p, at, body_len)
+    at = append_string(p, at, REQUEST_IDENTITY_PLACEHOLDER_LINE)
     at = append_string(p, at, HEADER_TAIL)
     var i = 0
     while i < body_len:
@@ -269,16 +277,59 @@ def build_response_exact(
     if extra_headers:
         head_pre += extra_headers
     head_pre += "Content-Length: "
-    var total = head_pre.byte_length() + decimal_digit_count(body_len) + HEADER_TAIL.byte_length() + body_len
+    var total = head_pre.byte_length() + decimal_digit_count(body_len) + REQUEST_IDENTITY_PLACEHOLDER_LINE.byte_length() + HEADER_TAIL.byte_length() + body_len
     var p = malloc_bytes(total)
     var at = append_string(p, 0, head_pre)
     at = write_decimal(p, at, body_len)
+    at = append_string(p, at, REQUEST_IDENTITY_PLACEHOLDER_LINE)
     at = append_string(p, at, HEADER_TAIL)
     var i = 0
     while i < body_len:
         p[at + i] = body[i]
         i += 1
     return ResponseBuffer(data=untrack(p), length=total)
+
+
+def refresh_response_request_identity(
+    response_data: UntrackedBytePtr, response_length: Int
+) -> None:
+    """Overwrite the placeholder request-identity digits in one prebuilt
+    response with a freshly minted identity, in place at equal width.
+
+    The placeholder line is baked by the response builders with fixed-width
+    zero-padded digit groups (REQUEST_IDENTITY_DIGIT_WIDTH each), so the
+    refresh never moves a byte: it locates the line inside the response head
+    (bounded by the head terminator, never touching the body) and rewrites
+    the two digit groups. Callers stamp every outgoing response, which keeps
+    identities per-request the way the reference middleware does, including
+    on responses served from startup-prebuilt buffers.
+    """
+    if response_length < 40:
+        return
+    var head_end = find_header_end(retracked(response_data), 0, response_length)
+    if head_end < 0:
+        head_end = response_length
+    var key_bytes = REQUEST_IDENTITY_KEY.as_bytes()
+    var key_length = len(key_bytes)
+    var scan_limit = head_end - key_length - 1
+    var scan_index = 0
+    while scan_index < scan_limit:
+        var matched = True
+        var key_index = 0
+        while key_index < key_length:
+            if response_data[scan_index + key_index] != key_bytes[key_index]:
+                matched = False
+                break
+            key_index += 1
+        if matched:
+            var fresh_identity = fixed_width_request_identity()
+            var identity_bytes = fresh_identity.as_bytes()
+            var identity_index = 0
+            while identity_index < len(identity_bytes):
+                response_data[scan_index + key_length + identity_index] = identity_bytes[identity_index]
+                identity_index += 1
+            return
+        scan_index += 1
 
 
 def find_header_end(p: BytePtr, start: Int, end: Int) -> Int:
