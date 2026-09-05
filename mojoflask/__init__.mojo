@@ -21,6 +21,19 @@ Public API
                                   byte-range String materialization,
                                   percent_encode_unreserved(),
                                   utf8_rune_at() validating UTF-8 decode
+    statemod                      publish_state_slot/publish_state_address(),
+                                  find_published_state_address(),
+                                  state_slot_as_type(),
+                                  allocate_string_that_is_never_freed(),
+                                  hash_name_to_hex64(), StateSlot
+    serving send helpers          send_response(),
+                                  send_response_taking_ownership_of_bytes(),
+                                  send_serde_buffer_as_json(),
+                                  send_buffered_response_as_text(),
+                                  build_preformatted_json_response(),
+                                  build_preformatted_text_response(),
+                                  STATUS_*/CONTENT_TYPE_* constants,
+                                  RESPONSE_HEADER_TAIL
     WorkerConfig / worker_config_from_env()
     serve(config, routes, responses)
                                   bind + fork + poll event loop, never returns
@@ -100,6 +113,30 @@ from .router import (
     ROUTE_STATIC,
     RouteTable,
     route_table,
+)
+
+from .statemod import (
+    StateSlot,
+    allocate_string_that_is_never_freed,
+    find_published_state_address,
+    hash_name_to_hex64,
+    publish_state_address,
+    publish_state_slot,
+    state_slot_as_type,
+)
+
+from .serving import (
+    CONTENT_TYPE_JSON,
+    CONTENT_TYPE_TEXT_UTF8,
+    RESPONSE_HEADER_TAIL,
+    STATUS_BAD_REQUEST,
+    STATUS_OK,
+    build_preformatted_json_response,
+    build_preformatted_text_response,
+    send_buffered_response_as_text,
+    send_response,
+    send_response_taking_ownership_of_bytes,
+    send_serde_buffer_as_json,
 )
 
 from .server import (
